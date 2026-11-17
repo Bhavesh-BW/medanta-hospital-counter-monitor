@@ -245,7 +245,6 @@ export default function App() {
   const hourlyHours = state?.hourly_rush?.hours || [];
   const maxHourlyWait = Math.max(10, ...(hourlyHours.map(h => h.avg_wait_mins || 0)));
   const peakHour = state?.hourly_rush?.peak_hour;
-  const busyStats = state?.busy_stats || {};
 
   const selectedWorkerState = state?.workers?.[selectedCounter.id] || {};
   const isSelectedUnattended = selectedWorkerState.status === 'unattended';
@@ -310,8 +309,8 @@ export default function App() {
           <div className="kpi-icon-wrap kpi-icon-purple">⏱️</div>
           <div>
             <div className="kpi-val">{activeKpis.avg_wait_mins} <span style={{ fontSize: 15 }}>mins</span></div>
-            <div className="kpi-label">{timeRange === 'today' ? 'Avg. Queue Wait Time' : 'Period Avg. Wait Time'}</div>
-            <div className="kpi-sub green">{timeRange === 'today' ? 'Target < 5m' : `${timeRange.toUpperCase()} Operational Avg`}</div>
+            <div className="kpi-label">Avg. Queue Wait Time</div>
+            <div className="kpi-sub green">Target &lt; 5m</div>
           </div>
         </div>
 
@@ -320,11 +319,7 @@ export default function App() {
           <div>
             <div className="kpi-val">{activeKpis.current_queue_total} <span style={{ fontSize: 15 }}>people</span></div>
             <div className="kpi-label">{timeRange === 'today' ? 'Current Queue Length' : 'Avg. Queue Length'}</div>
-            <div className="kpi-sub blue">
-              {selectedCounterId === 'all'
-                ? (timeRange === 'today' ? 'Across all counters' : 'Campus period average')
-                : `${selectedCounter.name}`}
-            </div>
+            <div className="kpi-sub blue">{selectedCounterId === 'all' ? 'Across all counters' : `${selectedCounter.name}`}</div>
           </div>
         </div>
 
@@ -333,9 +328,7 @@ export default function App() {
           <div>
             <div className="kpi-val">{activeKpis.max_queue_single || 0} <span style={{ fontSize: 15 }}>people</span></div>
             <div className="kpi-label">Peak Queue ({timeRange === 'today' ? 'Today' : 'Period'})</div>
-            <div style={{ fontSize: 11, color: '#94a3b8' }}>
-              ({activeKpis.max_queue_time_today ? `Peak at ${activeKpis.max_queue_time_today}` : 'Monitored Shift'})
-            </div>
+            <div style={{ fontSize: 11, color: '#94a3b8' }}>({activeKpis.max_queue_time_today || 'Shift'})</div>
           </div>
         </div>
 
@@ -355,23 +348,13 @@ export default function App() {
         <div className="kpi-card">
           <div className="kpi-icon-wrap kpi-icon-teal">👨‍💼</div>
           <div>
-            {timeRange === 'today' ? (
-              <>
-                <div className="kpi-val">{activeKpis.total_staff_active ?? activeKpis.staffed_count} <span style={{ fontSize: 15 }}>active</span></div>
-                <div className="kpi-label">Active Staff on Duty</div>
-                <div className="kpi-sub green">
-                  {selectedCounterId === 'all'
-                    ? `${activeKpis.staffed_count} / ${activeKpis.total_counters} Counters (${activeKpis.staffed_percentage}%)`
-                    : (activeKpis.total_staff_active > 0 ? `${activeKpis.total_staff_active} Staff Present at Desk` : 'Staff Absent')}
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="kpi-val">{activeKpis.staffed_percentage || 96} <span style={{ fontSize: 15 }}>%</span></div>
-                <div className="kpi-label">Staff Desk Compliance</div>
-                <div className="kpi-sub green">Shift presence ({activeKpis.staffed_count || 2} active desks)</div>
-              </>
-            )}
+            <div className="kpi-val">{activeKpis.total_staff_active ?? activeKpis.staffed_count} <span style={{ fontSize: 15 }}>active</span></div>
+            <div className="kpi-label">Active Staff on Duty</div>
+            <div className="kpi-sub green">
+              {selectedCounterId === 'all'
+                ? `${activeKpis.staffed_count} / ${activeKpis.total_counters} Counters (${activeKpis.staffed_percentage}%)`
+                : (activeKpis.total_staff_active > 0 ? `${activeKpis.total_staff_active} Staff Present at Desk` : 'Staff Absent')}
+            </div>
           </div>
         </div>
       </section>
@@ -425,57 +408,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Multi-Day Busy Hours & Rush Window Summary Bar */}
-          {timeRange !== 'today' && (
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(4, 1fr)',
-              gap: 6,
-              background: '#f8fafc',
-              border: '1px solid #e2e8f0',
-              borderRadius: 8,
-              padding: '7px 8px',
-              margin: '6px 0 10px 0',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 16 }}>🔥</span>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>
-                    {busyStats.busy_hours_count ?? 0} hrs
-                  </div>
-                  <div style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>Busy Rush Hours</div>
-                </div>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 16 }}>⚡</span>
-                <div>
-                  <div style={{ fontSize: 11.5, fontWeight: 700, color: '#0284c7', whiteSpace: 'nowrap' }}>
-                    {busyStats.peak_rush_window || '10:00 AM – 01:30 PM'}
-                  </div>
-                  <div style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>Peak Rush Window</div>
-                </div>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 16 }}>📈</span>
-                <div>
-                  <div style={{ fontSize: 11.5, fontWeight: 700, color: '#d97706', whiteSpace: 'nowrap' }}>
-                    {busyStats.busiest_day || '--'}
-                  </div>
-                  <div style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>Busiest Day &amp; Peak</div>
-                </div>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 16 }}>⏱️</span>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: '#dc2626' }}>
-                    {busyStats.avg_rush_wait ?? 0} mins
-                  </div>
-                  <div style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>Avg Wait in Rush</div>
-                </div>
-              </div>
-            </div>
-          )}
-
           {trendViewMode === 'rolling' ? (
             <div style={{ position: 'relative', width: '100%', flex: 1, minHeight: 180, display: 'flex', flexDirection: 'column' }}>
               <svg viewBox={`0 0 ${chartW} ${chartH}`} style={{ width: '100%', height: '100%', overflow: 'visible' }}>
@@ -520,16 +452,16 @@ export default function App() {
                   />
                 )}
 
-                {/* Data Point Nodes - Highlight Busy Hours with Amber/Red */}
+                {/* Data Point Nodes */}
                 {points.map((pt, i) => (
                   <circle
                     key={`pt-${i}`}
                     cx={pt.x}
                     cy={pt.y}
-                    r={hoveredTrendPoint?.idx === i ? "6" : (pt.is_busy ? "3.5" : "2.2")}
-                    fill={pt.is_busy ? "#f59e0b" : "#0284c7"}
+                    r={hoveredTrendPoint?.idx === i ? "5" : "2.5"}
+                    fill="#0284c7"
                     stroke="#ffffff"
-                    strokeWidth={pt.is_busy ? "1.8" : "1.2"}
+                    strokeWidth="1.5"
                     style={{ cursor: 'pointer', transition: 'r 0.15s' }}
                     onMouseEnter={() => setHoveredTrendPoint({ ...pt, idx: i })}
                     onMouseLeave={() => setHoveredTrendPoint(null)}
@@ -542,14 +474,9 @@ export default function App() {
                     <text x={points[0].x} y={paddingT + innerH + 16} fontSize="9" fill="#94a3b8">
                       {points[0].short_time || points[0].time || 'Earlier'}
                     </text>
-                    {points.length > 4 && (
-                      <text x={points[Math.floor(points.length * 0.33)].x} y={paddingT + innerH + 16} fontSize="9" fill="#94a3b8" textAnchor="middle">
-                        {points[Math.floor(points.length * 0.33)].short_time || points[Math.floor(points.length * 0.33)].time}
-                      </text>
-                    )}
-                    {points.length > 4 && (
-                      <text x={points[Math.floor(points.length * 0.66)].x} y={paddingT + innerH + 16} fontSize="9" fill="#94a3b8" textAnchor="middle">
-                        {points[Math.floor(points.length * 0.66)].short_time || points[Math.floor(points.length * 0.66)].time}
+                    {points.length > 2 && (
+                      <text x={points[Math.floor(points.length / 2)].x} y={paddingT + innerH + 16} fontSize="9" fill="#94a3b8" textAnchor="middle">
+                        {points[Math.floor(points.length / 2)].short_time || points[Math.floor(points.length / 2)].time}
                       </text>
                     )}
                     <text x={points[points.length - 1].x} y={paddingT + innerH + 16} fontSize="9" fill="#94a3b8" textAnchor="end">
@@ -564,11 +491,11 @@ export default function App() {
                 <div
                   style={{
                     position: 'absolute',
-                    left: Math.min(hoveredTrendPoint.x + 8, chartW - 130),
-                    top: Math.max(hoveredTrendPoint.y - 50, 10),
+                    left: Math.min(hoveredTrendPoint.x + 8, chartW - 120),
+                    top: Math.max(hoveredTrendPoint.y - 45, 10),
                     background: '#0f172a',
                     color: 'white',
-                    padding: '5px 9px',
+                    padding: '4px 8px',
                     borderRadius: 6,
                     fontSize: 11,
                     boxShadow: '0 4px 6px rgba(0,0,0,0.3)',
@@ -578,18 +505,11 @@ export default function App() {
                 >
                   <div><strong>{hoveredTrendPoint.time || hoveredTrendPoint.short_time} IST</strong></div>
                   <div>Queue: <strong>{hoveredTrendPoint.queue}</strong> | Wait: <strong>{hoveredTrendPoint.est_wait_mins}m</strong></div>
-                  {hoveredTrendPoint.is_busy && (
-                    <div style={{ color: '#f59e0b', fontWeight: 700, fontSize: 10.5, marginTop: 2 }}>
-                      🔥 High Rush Hour (Peak Q: {hoveredTrendPoint.max_queue || hoveredTrendPoint.queue})
-                    </div>
-                  )}
                 </div>
               )}
 
               <div style={{ fontSize: 11, color: '#64748b', textAlign: 'center', marginTop: 4 }}>
-                {timeRange === 'today'
-                  ? 'Live dynamic time-series sampled continuously in IST from AI tracker engine'
-                  : `Multi-day historical queue analytics across ${timeRange === '3days' ? 'Last 3 Days' : timeRange === '7days' ? 'Last 7 Days' : timeRange} in IST`}
+                Live dynamic time-series sampled continuously in IST from AI tracker engine
               </div>
             </div>
           ) : (
@@ -609,7 +529,7 @@ export default function App() {
                   }}
                 >
                   <span style={{ color: '#92400e', fontWeight: 700 }}>
-                    🔥 Peak Busy Hour: {peakHour.date_label ? `${peakHour.date_label} ` : ''}{peakHour.hour_label} (Max {peakHour.max_queue} in queue, ~{peakHour.avg_wait_mins}m wait)
+                    🔥 Peak Busy Hour: {peakHour.hour_label} (Max {peakHour.max_queue} in queue, ~{peakHour.avg_wait_mins}m wait)
                   </span>
                   <span style={{ color: '#b45309', fontSize: 10.5, fontWeight: 600 }}>
                     Coverage: {peakHour.staff_percentage}%
@@ -762,6 +682,8 @@ export default function App() {
                         <span className="badge" style={{ background: '#f1f5f9', color: '#64748b', border: '1px solid #e2e8f0' }}>Closed (Off-Shift)</span>
                       ) : isUnattended ? (
                         <span className="badge badge-unattended">Unattended</span>
+                      ) : w.phone_usage_active ? (
+                        <span className="badge" style={{ background: '#fdf2f8', color: '#db2777', border: '1px solid #fbcfe8', fontWeight: 700 }}>📱 Phone in Use</span>
                       ) : w.staff_present ? (
                         <span className="badge badge-normal">Active</span>
                       ) : (
@@ -986,6 +908,22 @@ export default function App() {
                     )}
                     {ev.event_type === 'presence_restored' && (
                       <span className="badge badge-normal">Normal (Staff Restored)</span>
+                    )}
+                    {(ev.event_type === 'phone_usage' || ev.event_type === 'phone_usage_staff' || ev.event_type === 'phone_usage_queue') && (
+                      <span
+                        className="badge"
+                        style={{
+                          background: '#fdf2f8',
+                          color: '#db2777',
+                          border: '1px solid #fbcfe8',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 4,
+                          fontWeight: 700,
+                        }}
+                      >
+                        📱 {ev.event_type === 'phone_usage_staff' ? 'Staff Phone Usage' : 'Mobile Phone Detected'}
+                      </span>
                     )}
                   </td>
                   <td>{ev.details}</td>

@@ -37,9 +37,20 @@ from ultralytics import YOLO
 ROOT = pathlib.Path(__file__).resolve().parent
 MODELS = ROOT / 'models'
 DIST_DIR = ROOT / 'dist'
+VIDEOS_DIR = ROOT / 'videos'
 DB_PATH = os.environ.get('COUNTER_MONITOR_DB', str(ROOT / 'counter_monitor.db'))
 RTSP_BASE = os.environ.get('RTSP_BASE', 'rtsp://124.123.89.162:31554/live')
 DEVICE = os.environ.get('DEVICE', 'cuda:0' if torch.cuda.is_available() else 'cpu')
+
+# ── Stream Source Flag ─────────────────────────────────────────────────────────
+# Set USE_VIDEO_FALLBACK = True  → use local video file from backend/videos/
+# Set USE_VIDEO_FALLBACK = False → use live RTSP stream
+USE_VIDEO_FALLBACK = False
+
+# Video file to use when USE_VIDEO_FALLBACK is True.
+# Each counter can have its own file; if not found, falls back to this default.
+VIDEO_FALLBACK_FILE = 'reception1_20261102_181753_60s.mp4'
+# ──────────────────────────────────────────────────────────────────────────────
 
 MIME_TYPES = {
     '.html': 'text/html; charset=utf-8',
@@ -62,6 +73,7 @@ COLOR_UNATTENDED = (40, 40, 240)      # Red
 COLOR_NORMAL = (60, 200, 60)          # Green
 COLOR_AWAY = (40, 180, 240)           # Orange
 COLOR_BG_DARK = (20, 22, 28)
+COLOR_PHONE = (235, 52, 198)          # Magenta / Pink for mobile phone usage
 
 DEFAULT_INITIAL_COUNTERS = [
     {
@@ -137,7 +149,7 @@ class Store:
         pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
-        self.lock = threading.RLock()
+        self.lock = threading.Lock()
         with self.lock:
             # Counters configuration table
             self.db.execute('''
@@ -208,138 +220,43 @@ class Store:
                 INSERT INTO counter_trends (timestamp, counter_id, queue_length, avg_wait_seconds, est_wait_mins, staff_present)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (ts, counter_id, int(queue_length), float(avg_wait_seconds), float(est_wait_mins), 1 if staff_present else 0))
-            # Retain up to 100,000 samples (~weeks of continuous history)
-            self.db.execute('DELETE FROM counter_trends WHERE id NOT IN (SELECT id FROM counter_trends ORDER BY id DESC LIMIT 100000)')
+            self.db.execute('DELETE FROM counter_trends WHERE id NOT IN (SELECT id FROM counter_trends ORDER BY id DESC LIMIT 5000)')
             self.db.commit()
 
     def get_trends(self, counter_id=None, limit=50, time_range='today'):
         with self.lock:
             cur = self.db.cursor()
             start_ts, end_ts = _get_time_window(time_range)
-
-            if time_range == 'today':
-                if counter_id and counter_id != 'all':
-                    cur.execute('''
-                        SELECT timestamp, counter_id, queue_length, avg_wait_seconds, est_wait_mins, staff_present
-                        FROM counter_trends
-                        WHERE counter_id = ? AND timestamp >= ? AND timestamp <= ?
-                        ORDER BY timestamp DESC LIMIT ?
-                    ''', (counter_id, start_ts, end_ts, limit))
-                else:
-                    cur.execute('''
-                        SELECT timestamp, counter_id, queue_length, avg_wait_seconds, est_wait_mins, staff_present
-                        FROM counter_trends
-                        WHERE timestamp >= ? AND timestamp <= ?
-                        ORDER BY timestamp DESC LIMIT ?
-                    ''', (start_ts, end_ts, limit * 2))
-                rows = cur.fetchall()
-                rows.reverse()
-                points = []
-                for r in rows:
-                    is_busy = (r[2] >= 4 or r[4] >= 8.0)
-                    points.append({
-                        'timestamp': r[0],
-                        'time': format_ist_short(r[0]),
-                        'short_time': format_ist_short(r[0]),
-                        'full_time': format_ist_time(r[0]),
-                        'date': format_ist_time(r[0], '%d %b'),
-                        'counter_id': r[1],
-                        'queue': r[2],
-                        'avg_wait_sec': r[3],
-                        'est_wait_mins': r[4],
-                        'staff_present': bool(r[5]),
-                        'is_busy': is_busy,
-                    })
-                return points
-
-            # Multi-day / historical ranges: Downsample into evenly-spaced buckets across the period
-            if time_range == 'yesterday':
-                bucket_ms = 3600 * 1000  # 1 hour
-            elif time_range == '3days':
-                bucket_ms = 3600 * 1000  # 1 hour
-            elif time_range == '7days':
-                bucket_ms = 2 * 3600 * 1000  # 2 hours
-            else:
-                bucket_ms = 4 * 3600 * 1000
-
             if counter_id and counter_id != 'all':
                 cur.execute('''
-                    SELECT timestamp, queue_length, avg_wait_seconds, est_wait_mins, staff_present
+                    SELECT timestamp, counter_id, queue_length, avg_wait_seconds, est_wait_mins, staff_present
                     FROM counter_trends
                     WHERE counter_id = ? AND timestamp >= ? AND timestamp <= ?
-                    ORDER BY timestamp ASC
-                ''', (counter_id, start_ts, end_ts))
+                    ORDER BY timestamp DESC LIMIT ?
+                ''', (counter_id, start_ts, end_ts, limit))
             else:
                 cur.execute('''
-                    SELECT timestamp, queue_length, avg_wait_seconds, est_wait_mins, staff_present
+                    SELECT timestamp, counter_id, queue_length, avg_wait_seconds, est_wait_mins, staff_present
                     FROM counter_trends
                     WHERE timestamp >= ? AND timestamp <= ?
-                    ORDER BY timestamp ASC
-                ''', (start_ts, end_ts))
+                    ORDER BY timestamp DESC LIMIT ?
+                ''', (start_ts, end_ts, limit * 2))
             rows = cur.fetchall()
-
-            if not rows:
-                return []
-
-            buckets = {}
-            for r in rows:
-                ts = r[0]
-                b_idx = (ts - start_ts) // bucket_ms
-                if b_idx not in buckets:
-                    buckets[b_idx] = {
-                        'start_ts': start_ts + b_idx * bucket_ms,
-                        'end_ts': start_ts + (b_idx + 1) * bucket_ms,
-                        'count': 0,
-                        'total_queue': 0,
-                        'max_queue': 0,
-                        'total_wait_sec': 0.0,
-                        'total_wait_mins': 0.0,
-                        'staff_count': 0
-                    }
-                b = buckets[b_idx]
-                b['count'] += 1
-                q = r[1]
-                b['total_queue'] += q
-                if q > b['max_queue']:
-                    b['max_queue'] = q
-                b['total_wait_sec'] += r[2]
-                b['total_wait_mins'] += r[3]
-                if r[4]:
-                    b['staff_count'] += 1
-
+            rows.reverse()
             points = []
-            for b_idx in sorted(buckets.keys()):
-                b = buckets[b_idx]
-                n = max(1, b['count'])
-                mid_ts = int((b['start_ts'] + b['end_ts']) / 2)
-                avg_q = round(b['total_queue'] / n, 1)
-                avg_w = round(b['total_wait_mins'] / n, 1)
-                avg_w_sec = round(b['total_wait_sec'] / n, 1)
-                staff = bool(b['staff_count'] / n >= 0.5)
-                is_busy = (avg_q >= 4.0 or b['max_queue'] >= 5 or avg_w >= 8.0)
-
-                dt = time.gmtime(mid_ts / 1000.0 + 5.5 * 3600)
-                h12 = dt.tm_hour % 12 or 12
-                ampm = "AM" if dt.tm_hour < 12 else "PM"
-                hour_str = f"{h12:02d} {ampm}"
-                date_str = f"{dt.tm_mday:02d} {time.strftime('%b', dt)}"
-                short_time = f"{date_str} {hour_str}" if time_range in ('3days', '7days', 'all') else f"{hour_str}"
-
+            for r in rows:
                 points.append({
-                    'timestamp': mid_ts,
-                    'time': f"{date_str} {h12:02d}:{dt.tm_min:02d} {ampm}",
-                    'short_time': short_time,
-                    'full_time': format_ist_time(mid_ts, '%d %b %Y %I:%M %p'),
-                    'date': date_str,
-                    'counter_id': counter_id or 'all',
-                    'queue': int(round(avg_q)),
-                    'max_queue': b['max_queue'],
-                    'avg_wait_sec': avg_w_sec,
-                    'est_wait_mins': avg_w,
-                    'staff_present': staff,
-                    'is_busy': is_busy
+                    'timestamp': r[0],
+                    'time': format_ist_short(r[0]),
+                    'short_time': format_ist_short(r[0]),
+                    'full_time': format_ist_time(r[0]),
+                    'date': format_ist_time(r[0], '%d %b'),
+                    'counter_id': r[1],
+                    'queue': r[2],
+                    'avg_wait_sec': r[3],
+                    'est_wait_mins': r[4],
+                    'staff_present': bool(r[5])
                 })
-
             return points
 
     def get_hourly_rush(self, counter_id=None, time_range='today'):
@@ -372,14 +289,13 @@ class Store:
                 h_12 = dt.tm_hour % 12 or 12
                 ampm = "AM" if dt.tm_hour < 12 else "PM"
                 hour_label = f"{h_12:02d} {ampm}"
-                date_label = f"{dt.tm_mday:02d} {time.strftime('%b', dt)}"
 
                 if hour_key not in hourly_map:
                     hourly_map[hour_key] = {
                         'hour_key': hour_key,
                         'hour_label': hour_label,
                         'hour_num': dt.tm_hour,
-                        'date_label': date_label,
+                        'date_label': f"{dt.tm_mday:02d} {time.strftime('%b', dt)}",
                         'samples': 0,
                         'total_queue': 0,
                         'max_queue': 0,
@@ -398,15 +314,13 @@ class Store:
                     h_entry['staff_samples'] += 1
 
             hours_list = []
-            busy_hours = []
             for k in sorted(hourly_map.keys()):
                 entry = hourly_map[k]
                 n = max(1, entry['samples'])
                 avg_q = round(entry['total_queue'] / n, 1)
                 avg_w = round(entry['total_wait'] / n, 1)
                 staff_pct = round((entry['staff_samples'] / n) * 100, 1)
-                is_busy = (avg_q >= 4.0 or entry['max_queue'] >= 5 or avg_w >= 8.0)
-                h_obj = {
+                hours_list.append({
                     'hour_key': entry['hour_key'],
                     'hour_label': entry['hour_label'],
                     'date_label': entry['date_label'],
@@ -414,11 +328,8 @@ class Store:
                     'max_queue': entry['max_queue'],
                     'avg_wait_mins': avg_w,
                     'staff_percentage': staff_pct,
-                    'is_busy': is_busy
-                }
-                hours_list.append(h_obj)
-                if is_busy:
-                    busy_hours.append(h_obj)
+                    'is_busy': avg_q >= 3 or entry['max_queue'] >= 5
+                })
 
             peak_hour = None
             if hours_list:
@@ -426,9 +337,7 @@ class Store:
 
             return {
                 'hours': hours_list,
-                'peak_hour': peak_hour,
-                'busy_hours_count': len(busy_hours),
-                'total_hours': len(hours_list)
+                'peak_hour': peak_hour
             }
 
     def get_counters(self):
@@ -529,73 +438,45 @@ class Store:
             cur = self.db.cursor()
             start_ts, end_ts = _get_time_window(time_range)
 
-            # Peak queue from trends
+            # Max queue from trends
             if counter_id and counter_id != 'all':
                 cur.execute('''
-                    SELECT queue_length, timestamp, est_wait_mins
+                    SELECT queue_length, timestamp
                     FROM counter_trends
-                    WHERE counter_id = ? AND timestamp >= ? AND timestamp <= ?
-                    ORDER BY queue_length DESC, est_wait_mins DESC LIMIT 1
-                ''', (counter_id, start_ts, end_ts))
-            else:
-                cur.execute('''
-                    SELECT queue_length, timestamp, est_wait_mins
-                    FROM counter_trends
-                    WHERE timestamp >= ? AND timestamp <= ?
-                    ORDER BY queue_length DESC, est_wait_mins DESC LIMIT 1
-                ''', (start_ts, end_ts))
-            row_peak_trend = cur.fetchone()
-
-            # Peak queue from events
-            if counter_id and counter_id != 'all':
-                cur.execute('''
-                    SELECT queue_length, timestamp, avg_wait_seconds
-                    FROM counter_events
                     WHERE counter_id = ? AND timestamp >= ? AND timestamp <= ?
                     ORDER BY queue_length DESC, timestamp DESC LIMIT 1
                 ''', (counter_id, start_ts, end_ts))
             else:
                 cur.execute('''
-                    SELECT queue_length, timestamp, avg_wait_seconds
-                    FROM counter_events
+                    SELECT queue_length, timestamp
+                    FROM counter_trends
                     WHERE timestamp >= ? AND timestamp <= ?
                     ORDER BY queue_length DESC, timestamp DESC LIMIT 1
                 ''', (start_ts, end_ts))
-            row_peak_event = cur.fetchone()
-
-            max_q = 0
-            peak_ts = None
-            if row_peak_trend and row_peak_trend[0] is not None:
-                max_q = row_peak_trend[0]
-                peak_ts = row_peak_trend[1]
-            if row_peak_event and row_peak_event[0] is not None and row_peak_event[0] >= max_q:
-                max_q = row_peak_event[0]
-                peak_ts = row_peak_event[1]
-
-            if peak_ts:
-                peak_time = format_ist_time(peak_ts, '%d %b %I:%M %p') if time_range != 'today' else format_ist_short(peak_ts)
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                max_q = row[0]
+                peak_time = format_ist_short(row[1])
             else:
+                max_q = 0
                 peak_time = '--'
 
-            # Historical averages during active operating hours (08:00 - 18:30) or when traffic is present
+            # Historical averages
             if counter_id and counter_id != 'all':
                 cur.execute('''
-                    SELECT AVG(est_wait_mins), AVG(queue_length), AVG(staff_present)
+                    SELECT AVG(est_wait_mins), AVG(queue_length)
                     FROM counter_trends
                     WHERE counter_id = ? AND timestamp >= ? AND timestamp <= ?
-                      AND (CAST(strftime('%H', datetime(timestamp/1000 + 19800, 'unixepoch')) AS INTEGER) BETWEEN 8 AND 18 OR queue_length > 0)
                 ''', (counter_id, start_ts, end_ts))
             else:
                 cur.execute('''
-                    SELECT AVG(est_wait_mins), AVG(queue_length), AVG(staff_present)
+                    SELECT AVG(est_wait_mins), AVG(queue_length)
                     FROM counter_trends
                     WHERE timestamp >= ? AND timestamp <= ?
-                      AND (CAST(strftime('%H', datetime(timestamp/1000 + 19800, 'unixepoch')) AS INTEGER) BETWEEN 8 AND 18 OR queue_length > 0)
                 ''', (start_ts, end_ts))
             row_avg = cur.fetchone()
             hist_wait = round(row_avg[0], 1) if (row_avg and row_avg[0] is not None) else 0.0
             hist_q = round(row_avg[1], 1) if (row_avg and row_avg[1] is not None) else 0.0
-            staff_pct = round(row_avg[2] * 100, 1) if (row_avg and row_avg[2] is not None) else 96.0
 
             # Count of alerts / unattended
             if counter_id and counter_id != 'all':
@@ -627,39 +508,13 @@ class Store:
                 ''', (start_ts, end_ts))
             tot_events = cur.fetchone()[0] or 0
 
-            # Busy rush stats across period
-            rush_data = self.get_hourly_rush(counter_id=counter_id, time_range=time_range)
-            busy_hours_count = rush_data.get('busy_hours_count', 0)
-            busy_hours_list = [h for h in rush_data.get('hours', []) if h.get('is_busy')]
-            avg_rush_wait = round(sum(h['avg_wait_mins'] for h in busy_hours_list) / max(1, len(busy_hours_list)), 1) if busy_hours_list else 0.0
-
-            # Busiest day
-            daily_max = {}
-            for h in rush_data.get('hours', []):
-                dl = h.get('date_label')
-                if dl:
-                    daily_max[dl] = max(daily_max.get(dl, 0), h.get('max_queue', 0))
-            if daily_max:
-                best_day, best_q = max(daily_max.items(), key=lambda x: x[1])
-                busiest_day_str = f"{best_day} (Peak: {best_q} persons)"
-            else:
-                busiest_day_str = "--"
-
-            peak_rush_window = "10:00 AM – 01:30 PM" if busy_hours_count > 0 else "--"
-
             return {
                 'max_queue': max_q,
                 'max_queue_time': peak_time,
                 'hist_avg_wait': hist_wait,
                 'hist_avg_queue': hist_q,
-                'staff_compliance_pct': staff_pct,
                 'unattended_events': unatt_cnt,
-                'total_events': tot_events,
-                'busy_hours_count': busy_hours_count,
-                'peak_rush_window': peak_rush_window,
-                'busiest_day': busiest_day_str,
-                'avg_rush_wait': avg_rush_wait,
-                'total_monitored_hours': rush_data.get('total_hours', 0),
+                'total_events': tot_events
             }
 
     def get_events(self, limit=100, counter_id=None, severity=None, time_range='today'):
@@ -773,7 +628,7 @@ class CounterWorker(threading.Thread):
         self.config = config
         self.store = store
         self.model_pool = model_pool
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.running = True
 
         self.staff_zone = config['staff_zone']
@@ -804,6 +659,10 @@ class CounterWorker(threading.Thread):
         self.current_unattended_seconds = 0
         self.last_unattended_alert_sent = 0
         self.last_queue_alert_sent = 0
+        self.last_phone_alert_sent = 0
+        self.frame_idx = 0
+        self.active_phone_detections = []
+        self.phone_usage_active = False
 
     def is_in_monitoring_hours(self):
         if self.is_24_7:
@@ -866,146 +725,229 @@ class CounterWorker(threading.Thread):
         if not stream_url.startswith('rtsp://') and not stream_url.startswith('http://'):
             stream_url = f"{RTSP_BASE}/{stream_url}"
 
-        while self.running:
-            cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
-            if not cap.isOpened():
+        # Resolve video file path for video-fallback mode
+        # Per-counter file: backend/videos/{counter_id}.mp4, else shared VIDEO_FALLBACK_FILE
+        counter_video = VIDEOS_DIR / f"{self.config['id']}.mp4"
+        if not counter_video.exists():
+            counter_video = VIDEOS_DIR / VIDEO_FALLBACK_FILE
+
+        fallback_snap_path = ROOT / f"test_snap_{self.config['id']}.jpg"
+        if not fallback_snap_path.exists():
+            fallback_snap_path = ROOT / "test_snap_recep1.jpg"
+
+        frame_times = collections.deque(maxlen=30)
+        last_rtsp_attempt = 0
+        cap = None
+
+        # ── Open video capture source based on USE_VIDEO_FALLBACK flag ──
+        if USE_VIDEO_FALLBACK:
+            if counter_video.exists():
+                cap = cv2.VideoCapture(str(counter_video))
                 with self.lock:
-                    self.error = f"Stream offline ({self.config['stream']}), standby mode"
-                    # Load fallback snapshot if available so UI displays zone overlay
-                    if self.latest_jpeg is None:
-                        fallback_path = ROOT / 'test_snap_recep1.jpg'
-                        if fallback_path.exists():
-                            fb_img = cv2.imread(str(fallback_path))
-                            if fb_img is not None:
-                                hud_fb = fb_img.copy()
-                                in_mon, _ = self.is_in_monitoring_hours()
-                                self._render_hud(hud_fb, self.staff_zone, self.queue_zone, [], False, 0, 0, 0.0, 'idle', 0, self.capacity_threshold, self.service_time_mins, in_mon)
-                                _, fb_enc = cv2.imencode('.jpg', hud_fb, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                                self.latest_jpeg = fb_enc.tobytes()
-                                _, fb_raw = cv2.imencode('.jpg', fb_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                                self.latest_snapshot = fb_raw.tobytes()
-                time.sleep(10.0)
-                continue
+                    self.error = f"VIDEO MODE: playing {counter_video.name}"
+            else:
+                with self.lock:
+                    self.error = f"VIDEO MODE: file not found ({counter_video.name})"
+
+        while self.running:
+            t0 = time.time()
+            now = time.time()
+
+            if USE_VIDEO_FALLBACK:
+                # ── Video file mode: read next frame, loop on end ──
+                frame = None
+                is_fallback = False
+                if cap is not None and cap.isOpened():
+                    ret, r_frame = cap.read()
+                    if ret and r_frame is not None:
+                        frame = r_frame
+                    else:
+                        # End of video — loop back to start
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, r_frame = cap.read()
+                        if ret and r_frame is not None:
+                            frame = r_frame
+                if frame is None:
+                    frame = np.full((720, 1280, 3), (25, 28, 35), dtype=np.uint8)
+            else:
+                # ── Live RTSP stream mode ──
+                # Attempt RTSP reconnection every 6s if not currently connected
+                if cap is None or not cap.isOpened():
+                    if now - last_rtsp_attempt > 6.0:
+                        last_rtsp_attempt = now
+                        try:
+                            cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+                            if not cap.isOpened():
+                                cap = None
+                        except Exception:
+                            cap = None
+
+                frame = None
+                is_fallback = False
+
+                if cap is not None and cap.isOpened():
+                    ret, r_frame = cap.read()
+                    if ret and r_frame is not None:
+                        frame = r_frame
+                        with self.lock:
+                            self.error = None
+                    else:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                        with self.lock:
+                            self.error = f"Stream disconnected, reconnecting..."
+
+                if frame is None:
+                    # Fallback to test snapshot or standby canvas so stream and HUD remain live
+                    if fallback_snap_path.exists():
+                        frame = cv2.imread(str(fallback_snap_path))
+                        is_fallback = True
+                        with self.lock:
+                            if self.error is None:
+                                self.error = f"RTSP offline ({self.config['stream']}), standby feed active"
+                    else:
+                        frame = np.full((720, 1280, 3), (25, 28, 35), dtype=np.uint8)
+                        is_fallback = True
+
+            h, w = frame.shape[:2]
 
             with self.lock:
-                self.error = None
+                if self.latest_snapshot is None or (now % 3.0 < 0.15):
+                    _, snap_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    self.latest_snapshot = snap_buf.tobytes()
 
-            frame_times = collections.deque(maxlen=30)
+            self.frame_idx += 1
+            persons_in_staff = 0
+            persons_in_queue = []
 
-            while self.running:
-                t0 = time.time()
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    with self.lock:
-                        self.error = "Stream disconnected, retrying..."
-                    break
+            with self.model_pool.lock:
+                results = self.model_pool.model.predict(
+                    frame,
+                    classes=[0],
+                    conf=0.35,
+                    verbose=False,
+                    device=DEVICE,
+                    imgsz=640
+                )
 
-                h, w = frame.shape[:2]
-                now = time.time()
-
-                with self.lock:
-                    if self.latest_snapshot is None or (now % 3.0 < 0.15):
-                        _, snap_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        self.latest_snapshot = snap_buf.tobytes()
-
-                persons_in_staff = 0
-                persons_in_queue = []
-
-                with self.model_pool.lock:
-                    results = self.model_pool.model.predict(
+                # Mobile Phone Detection (runs periodically every 3 frames to maintain high video FPS)
+                if self.model_pool.phone_model is not None and (self.frame_idx % 3 == 0 or len(self.active_phone_detections) == 0):
+                    phone_res = self.model_pool.phone_model.predict(
                         frame,
-                        classes=[0],
-                        conf=0.35,
+                        classes=[0],  # 0: 'using_phone'
+                        conf=0.57,  # Raised from 0.30 to filter desk phones/POS terminals false positives
                         verbose=False,
                         device=DEVICE,
                         imgsz=640
                     )
-                scan_elapsed = (time.time() - t0) * 1000
+                    fresh_phone_dets = []
+                    for pr in phone_res:
+                        if pr.boxes is not None and len(pr.boxes) > 0:
+                            p_boxes = pr.boxes.xyxy.cpu().numpy().astype(int)
+                            p_confs = pr.boxes.conf.cpu().numpy()
+                            for pb, pc in zip(p_boxes, p_confs):
+                                # Person-overlap filter: only keep detections that overlap
+                                # with a tracked person bbox (>40% IoU). This eliminates
+                                # desk phones, POS terminals and other stationary objects.
+                                overlaps_person = any(
+                                    _iou(pb, tr.bbox) > 0.40
+                                    for tr in self.tracks if tr.misses == 0
+                                )
+                                if overlaps_person:
+                                    fresh_phone_dets.append((pb, float(pc), now))
+                    self.active_phone_detections = fresh_phone_dets
+                else:
+                    # Decay old phone detections after 1.5 seconds so boxes don't linger
+                    self.active_phone_detections = [pd for pd in self.active_phone_detections if (now - pd[2]) < 1.5]
+            scan_elapsed = (time.time() - t0) * 1000
 
-                detections = []
-                for r in results:
-                    if r.boxes is not None and len(r.boxes) > 0:
-                        xyxy = r.boxes.xyxy.cpu().numpy().astype(int)
-                        confs = r.boxes.conf.cpu().numpy()
-                        for box, conf in zip(xyxy, confs):
-                            detections.append((box, float(conf)))
+            detections = []
+            for r in results:
+                if r.boxes is not None and len(r.boxes) > 0:
+                    xyxy = r.boxes.xyxy.cpu().numpy().astype(int)
+                    confs = r.boxes.conf.cpu().numpy()
+                    for box, conf in zip(xyxy, confs):
+                        detections.append((box, float(conf)))
 
-                matched_tracks = set()
-                matched_dets = set()
+            matched_tracks = set()
+            matched_dets = set()
 
-                for ti, tr in enumerate(self.tracks):
-                    best_iou = 0.0
-                    best_di = -1
-                    for di, (box, conf) in enumerate(detections):
-                        if di in matched_dets:
-                            continue
-                        iou = _iou(tr.bbox, box)
-                        if iou > 0.25 and iou > best_iou:
-                            best_iou = iou
-                            best_di = di
-                    if best_di >= 0:
-                        tr.update(detections[best_di][0], detections[best_di][1], now)
-                        matched_tracks.add(ti)
-                        matched_dets.add(best_di)
-                    else:
-                        tr.misses += 1
-
+            for ti, tr in enumerate(self.tracks):
+                best_iou = 0.0
+                best_di = -1
                 for di, (box, conf) in enumerate(detections):
-                    if di not in matched_dets:
-                        new_tr = Track(self.next_track_id, box, conf, now)
-                        self.next_track_id += 1
-                        self.tracks.append(new_tr)
+                    if di in matched_dets:
+                        continue
+                    iou = _iou(tr.bbox, box)
+                    if iou > 0.25 and iou > best_iou:
+                        best_iou = iou
+                        best_di = di
+                if best_di >= 0:
+                    tr.update(detections[best_di][0], detections[best_di][1], now)
+                    matched_tracks.add(ti)
+                    matched_dets.add(best_di)
+                else:
+                    tr.misses += 1
 
-                self.tracks = [t for t in self.tracks if not t.is_dead(now, max_age_seconds=3.5)]
+            for di, (box, conf) in enumerate(detections):
+                if di not in matched_dets:
+                    new_tr = Track(self.next_track_id, box, conf, now)
+                    self.next_track_id += 1
+                    self.tracks.append(new_tr)
 
-                with self.lock:
-                    staff_poly = self.staff_zone
-                    queue_poly = self.queue_zone
-                    cap_thresh = self.capacity_threshold
-                    unattend_sec = self.unattended_seconds
-                    serv_mins = self.service_time_mins
+            self.tracks = [t for t in self.tracks if not t.is_dead(now, max_age_seconds=3.5)]
 
-                for tr in self.tracks:
-                    # Ground contact point: exact floor contact at shoe base for queue detection
-                    foot_x = (tr.bbox[0] + tr.bbox[2]) / 2.0
-                    foot_y = float(tr.bbox[3]) - 2.0
-                    pt_foot = (foot_x / w, foot_y / h)
+            with self.lock:
+                staff_poly = self.staff_zone
+                queue_poly = self.queue_zone
+                cap_thresh = self.capacity_threshold
+                unattend_sec = self.unattended_seconds
+                serv_mins = self.service_time_mins
 
-                    # Multi-point check for seated staff behind counter desk:
-                    # Staff are seated behind computer monitors and counter desks, so feet are often under
-                    # desks or cropped off-screen at bottom edge. We check foot, center, and upper torso.
-                    center_y = (tr.bbox[1] + tr.bbox[3]) / 2.0
-                    torso_y = tr.bbox[1] + 0.35 * (tr.bbox[3] - tr.bbox[1])
-                    pt_center = (foot_x / w, center_y / h)
-                    pt_torso = (foot_x / w, torso_y / h)
+            for tr in self.tracks:
+                # Ground contact point: exact floor contact at shoe base for queue detection
+                foot_x = (tr.bbox[0] + tr.bbox[2]) / 2.0
+                foot_y = float(tr.bbox[3]) - 2.0
+                pt_foot = (foot_x / w, foot_y / h)
 
-                    in_staff = (
-                        _point_in_norm_poly(pt_foot, staff_poly) or
-                        _point_in_norm_poly(pt_center, staff_poly) or
-                        _point_in_norm_poly(pt_torso, staff_poly)
-                    )
-                    in_queue = _point_in_norm_poly(pt_foot, queue_poly)
+                # Multi-point check for seated staff behind counter desk:
+                # Staff are seated behind computer monitors and counter desks, so feet are often under
+                # desks or cropped off-screen at bottom edge. We check foot, center, and upper torso.
+                center_y = (tr.bbox[1] + tr.bbox[3]) / 2.0
+                torso_y = tr.bbox[1] + 0.35 * (tr.bbox[3] - tr.bbox[1])
+                pt_center = (foot_x / w, center_y / h)
+                pt_torso = (foot_x / w, torso_y / h)
 
-                    if in_staff:
-                        tr.role = 'staff'
-                        persons_in_staff += 1
-                        tr.entry_queue_time = None
-                    elif in_queue:
-                        if tr.entry_queue_time is None:
-                            tr.entry_queue_time = now
-                        tr.dwell_seconds = max(0.0, now - tr.entry_queue_time)
+                in_staff = (
+                    _point_in_norm_poly(pt_foot, staff_poly) or
+                    _point_in_norm_poly(pt_center, staff_poly) or
+                    _point_in_norm_poly(pt_torso, staff_poly)
+                )
+                in_queue = _point_in_norm_poly(pt_foot, queue_poly)
 
-                        # Dwell time filter: requires 2.0 seconds standing before being counted as a waiting patient!
-                        # Fleeting passersby walking past in the background take < 1.5s and are filtered out.
-                        if tr.dwell_seconds >= 2.0:
-                            tr.role = 'queue'
-                            persons_in_queue.append(tr)
-                        else:
-                            tr.role = 'entering_queue'
+                if in_staff:
+                    tr.role = 'staff'
+                    persons_in_staff += 1
+                    tr.entry_queue_time = None
+                elif in_queue:
+                    if tr.entry_queue_time is None:
+                        tr.entry_queue_time = now
+                    tr.dwell_seconds = max(0.0, now - tr.entry_queue_time)
+
+                    # Dwell time filter: requires 2.0 seconds standing before being counted as a waiting patient!
+                    # Fleeting passersby walking past in the background take < 1.5s and are filtered out.
+                    if tr.dwell_seconds >= 2.0:
+                        tr.role = 'queue'
+                        persons_in_queue.append(tr)
                     else:
-                        tr.role = 'other'
-                        tr.entry_queue_time = None
-                        tr.dwell_seconds = 0.0
+                        tr.role = 'entering_queue'
+                else:
+                    tr.role = 'other'
+                    tr.entry_queue_time = None
+                    tr.dwell_seconds = 0.0
 
                 staff_present = (persons_in_staff > 0)
                 queue_count = len(persons_in_queue)
@@ -1067,8 +1009,71 @@ class CounterWorker(threading.Thread):
                     self.unattended_start_time = None
                     status = 'idle' if staff_present else 'idle_unstaffed'
 
+                # ── Mobile Phone Detection Spatial Matching & Event Logging ──
+                phone_in_counter = False
+                detected_phone_role = None
+                max_phone_conf = 0.0
+
+                for pb, pc, _ in getattr(self, 'active_phone_detections', []):
+                    p_cx = (pb[0] + pb[2]) / 2.0
+                    p_cy = (pb[1] + pb[3]) / 2.0
+                    p_foot_y = float(pb[3]) - 2.0
+                    norm_pt_center = (p_cx / w, p_cy / h)
+                    norm_pt_foot = (p_cx / w, p_foot_y / h)
+
+                    in_staff = (
+                        _point_in_norm_poly(norm_pt_center, staff_poly) or
+                        _point_in_norm_poly(norm_pt_foot, staff_poly)
+                    )
+                    in_queue = (
+                        _point_in_norm_poly(norm_pt_center, queue_poly) or
+                        _point_in_norm_poly(norm_pt_foot, queue_poly)
+                    )
+
+                    matched_track_role = None
+                    for tr in self.tracks:
+                        if tr.misses == 0 and _iou(tr.bbox, pb) > 0.08:
+                            matched_track_role = tr.role
+                            break
+
+                    if in_staff or matched_track_role == 'staff':
+                        phone_in_counter = True
+                        detected_phone_role = 'staff'
+                        max_phone_conf = max(max_phone_conf, pc)
+                        break
+                    elif in_queue or matched_track_role in ('queue', 'entering_queue'):
+                        phone_in_counter = True
+                        if detected_phone_role != 'staff':
+                            detected_phone_role = 'queue'
+                            max_phone_conf = max(max_phone_conf, pc)
+
+                self.phone_usage_active = phone_in_counter
+
+                if phone_in_counter and (now - self.last_phone_alert_sent > 30):
+                    self.last_phone_alert_sent = now
+                    if detected_phone_role == 'staff':
+                        ev_type = 'phone_usage_staff'
+                        severity = 'high'
+                        details = f"Staff member on duty detected using mobile phone at desk (Confidence: {max_phone_conf*100:.0f}%)"
+                    else:
+                        ev_type = 'phone_usage_queue'
+                        severity = 'medium'
+                        details = f"Customer at counter detected using mobile phone (Confidence: {max_phone_conf*100:.0f}%)"
+
+                    self.store.log_event({
+                        'counter_id': self.config['id'],
+                        'counter_name': self.config['name'],
+                        'event_type': ev_type,
+                        'severity': severity,
+                        'queue_length': queue_count,
+                        'avg_wait_seconds': avg_dwell,
+                        'staff_present': staff_present,
+                        'unattended_seconds': unattend_duration,
+                        'details': details
+                    })
+
                 hud_frame = frame.copy()
-                self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring)
+                self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring, is_fallback)
 
                 _, enc = cv2.imencode('.jpg', hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 jpeg_bytes = enc.tobytes()
@@ -1088,10 +1093,16 @@ class CounterWorker(threading.Thread):
                     self.status = status
                     self.current_unattended_seconds = unattend_duration
 
-            cap.release()
-            time.sleep(1.0)
+                if is_fallback:
+                    time.sleep(0.08)
 
-    def _render_hud(self, img, staff_poly, queue_poly, tracks, staff_present, staff_count, queue_count, avg_dwell, status, unattend_sec, cap_thresh, serv_mins, in_monitoring=True):
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+    def _render_hud(self, img, staff_poly, queue_poly, tracks, staff_present, staff_count, queue_count, avg_dwell, status, unattend_sec, cap_thresh, serv_mins, in_monitoring=True, is_fallback=False):
         h, w = img.shape[:2]
         overlay = img.copy()
         line_thick = max(3, int(w / 640))
@@ -1154,9 +1165,20 @@ class CounterWorker(threading.Thread):
             cv2.circle(img, (foot_cx, foot_cy), 5, color, -1, cv2.LINE_AA)
             cv2.circle(img, (foot_cx, foot_cy), 5, (255, 255, 255), 1, cv2.LINE_AA)
 
+        # Draw Mobile Phone Usage Bounding Boxes
+        for pb, pc, _ in getattr(self, 'active_phone_detections', []):
+            cv2.rectangle(img, (pb[0], pb[1]), (pb[2], pb[3]), COLOR_PHONE, 3)
+            phone_lbl = f"USING PHONE {int(pc * 100)}%"
+            (tw, th), _ = cv2.getTextSize(phone_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+            cv2.rectangle(img, (pb[0], max(0, pb[1] - th - 6)), (pb[0] + tw + 8, pb[1]), COLOR_PHONE, -1)
+            cv2.putText(img, phone_lbl, (pb[0] + 4, max(th + 2, pb[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+
         header_h = 40
         cv2.rectangle(img, (0, 0), (w, header_h), COLOR_BG_DARK, -1)
         cv2.putText(img, f"{self.config['name'].upper()}", (14, 27), cv2.FONT_HERSHEY_DUPLEX, 0.60, (240, 240, 240), 1, cv2.LINE_AA)
+
+        if getattr(self, 'phone_usage_active', False):
+            cv2.putText(img, "PHONE IN USE", (w - 470, 26), cv2.FONT_HERSHEY_DUPLEX, 0.55, COLOR_PHONE, 1, cv2.LINE_AA)
 
         queue_text = f"QUEUE: {queue_count} / {cap_thresh}"
         cv2.putText(img, queue_text, (w // 2 - 90, 26), cv2.FONT_HERSHEY_DUPLEX, 0.55, (40, 220, 255) if queue_count <= cap_thresh else (40, 60, 255), 1, cv2.LINE_AA)
@@ -1190,6 +1212,10 @@ class CounterWorker(threading.Thread):
             alert_str = f"ALERT: COUNTER UNATTENDED FOR {mins}m {secs:02d}s - PATIENTS WAITING IN QUEUE"
             (atw, ath), _ = cv2.getTextSize(alert_str, cv2.FONT_HERSHEY_DUPLEX, 0.60, 1)
             cv2.putText(img, alert_str, ((w - atw) // 2, h - 14), cv2.FONT_HERSHEY_DUPLEX, 0.60, (255, 255, 255), 1, cv2.LINE_AA)
+        elif is_fallback:
+            fb_text = f"STANDBY FEED (Waiting for camera RTSP publisher: {self.config['stream']})"
+            cv2.rectangle(img, (0, h - 34), (w, h), (15, 23, 42), -1)
+            cv2.putText(img, fb_text, (18, h - 11), cv2.FONT_HERSHEY_DUPLEX, 0.50, (40, 210, 245), 1, cv2.LINE_AA)
 
 
 # ── Shared Model Pool Singleton ──────────────────────────────────────────────
@@ -1202,10 +1228,22 @@ class ModelPool:
         if not model_path.exists():
             model_path = MODELS / 'yolo11s.pt'
         if not model_path.exists():
-            model_path = Path('yolo11n.pt')
+            model_path = pathlib.Path('yolo11n.pt')
         print(f"Loading YOLO person detector from {model_path} on {DEVICE}...")
         self.model = YOLO(str(model_path))
         print("YOLO person detector loaded successfully!")
+
+        # Mobile Phone Detection Model (best.pt)
+        phone_model_path = MODELS / 'best.pt'
+        if not phone_model_path.exists():
+            phone_model_path = ROOT / 'best.pt'
+        if phone_model_path.exists():
+            print(f"Loading Mobile Phone detector from {phone_model_path} on {DEVICE}...")
+            self.phone_model = YOLO(str(phone_model_path))
+            print(f"Mobile Phone detector loaded successfully! Classes: {self.phone_model.names}")
+        else:
+            self.phone_model = None
+            print("Notice: best.pt not found, mobile phone detection disabled.")
 
 
 # ── Server State & Manager ───────────────────────────────────────────────────
@@ -1294,6 +1332,7 @@ class CounterServer:
                     'monitoring_start': getattr(w, 'monitoring_start', '09:00'),
                     'monitoring_end': getattr(w, 'monitoring_end', '17:00'),
                     'is_24_7': getattr(w, 'is_24_7', False),
+                    'phone_usage_active': getattr(w, 'phone_usage_active', False),
                 }
 
             # Precompute KPIs per counter
@@ -1316,16 +1355,16 @@ class CounterServer:
                         'unattended_count': 1 if w_info['status'] == 'unattended' else 0,
                     }
                 else:
-                    has_data = (c_stats['total_events'] > 0 or c_stats['max_queue'] > 0 or c_stats['hist_avg_queue'] > 0)
+                    has_data = (c_stats['total_events'] > 0 or c_stats['max_queue'] > 0)
                     counter_kpis[cid] = {
                         'avg_wait_mins': c_stats['hist_avg_wait'],
                         'current_queue_total': int(round(c_stats['hist_avg_queue'])),
                         'max_queue_single': c_stats['max_queue'],
                         'max_queue_time_today': c_stats['max_queue_time'],
-                        'staffed_count': 1 if (has_data and c_stats['staff_compliance_pct'] >= 50) else 0,
-                        'total_staff_active': 1 if (has_data and c_stats['staff_compliance_pct'] >= 50) else 0,
+                        'staffed_count': 1 if (has_data and w_info['staff_present']) else 0,
+                        'total_staff_active': w_info['staff_count'] if has_data else 0,
                         'total_counters': 1,
-                        'staffed_percentage': int(round(c_stats['staff_compliance_pct'])) if has_data else 0,
+                        'staffed_percentage': 100 if (has_data and w_info['staff_present']) else 0,
                         'unattended_count': c_stats['unattended_events'],
                     }
 
@@ -1349,31 +1388,22 @@ class CounterServer:
                     'unattended_count': unattended_counters_count,
                 }
             else:
-                has_data = (all_stats['total_events'] > 0 or all_stats['max_queue'] > 0 or all_stats['hist_avg_queue'] > 0)
-                staff_active_hist = int(round((all_stats['staff_compliance_pct'] / 100.0) * max(1, active_counters_count)))
+                has_data = (all_stats['total_events'] > 0 or all_stats['max_queue'] > 0)
                 counter_kpis['all'] = {
                     'avg_wait_mins': all_stats['hist_avg_wait'],
                     'current_queue_total': int(round(all_stats['hist_avg_queue'])),
                     'max_queue_single': all_stats['max_queue'],
                     'max_queue_time_today': all_stats['max_queue_time'],
-                    'staffed_count': staff_active_hist if has_data else 0,
-                    'total_staff_active': staff_active_hist if has_data else 0,
+                    'staffed_count': staffed_counters_count if has_data else 0,
+                    'total_staff_active': total_staff_active if has_data else 0,
                     'total_counters': active_counters_count,
-                    'staffed_percentage': int(round(all_stats['staff_compliance_pct'])) if has_data else 0,
+                    'staffed_percentage': staffed_pct if has_data else 0,
                     'unattended_count': all_stats['unattended_events'],
                 }
 
             target_cid = counter_id if (counter_id and counter_id in counter_kpis) else 'all'
             selected_kpis = counter_kpis.get(target_cid, counter_kpis['all'])
             hourly_rush = self.store.get_hourly_rush(counter_id=target_cid, time_range=time_range)
-
-            busy_stats = {
-                'busy_hours_count': all_stats.get('busy_hours_count', 0),
-                'peak_rush_window': all_stats.get('peak_rush_window', '--'),
-                'busiest_day': all_stats.get('busiest_day', '--'),
-                'avg_rush_wait': all_stats.get('avg_rush_wait', 0.0),
-                'total_monitored_hours': all_stats.get('total_monitored_hours', 0),
-            }
 
             return {
                 'running': True,
@@ -1385,7 +1415,6 @@ class CounterServer:
                 'workers': worker_states,
                 'counters': self.store.get_counters(),
                 'hourly_rush': hourly_rush,
-                'busy_stats': busy_stats,
             }
 
     def update_counter_zones(self, counter_id, new_zones):
@@ -1439,14 +1468,6 @@ _SERVER = None
 
 
 class Handler(BaseHTTPRequestHandler):
-    def address_string(self):
-        # Disable slow reverse DNS lookups on Windows
-        return self.client_address[0]
-
-    def log_message(self, format, *args):
-        # Keep logs clean
-        pass
-
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors()
@@ -1510,6 +1531,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {'error': 'Counter not found'})
             with worker.lock:
                 snap = worker.latest_snapshot
+            if not snap:
+                test_snap_file = ROOT / f"test_snap_{cid}.jpg"
+                if not test_snap_file.exists():
+                    test_snap_file = ROOT / "test_snap_recep1.jpg"
+                if test_snap_file.exists():
+                    snap = test_snap_file.read_bytes()
             if not snap:
                 return self._json(503, {'error': 'Snapshot not available yet'})
             self.send_response(200)
