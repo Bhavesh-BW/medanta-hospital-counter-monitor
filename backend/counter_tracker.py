@@ -37,7 +37,52 @@ from ultralytics import YOLO
 ROOT = pathlib.Path(__file__).resolve().parent
 MODELS = ROOT / 'models'
 DIST_DIR = ROOT / 'dist'
-DB_PATH = os.environ.get('COUNTER_MONITOR_DB', str(ROOT / 'counter_monitor.db'))
+LIVE_DB_PATH = os.environ.get('COUNTER_MONITOR_DB', str(ROOT / 'counter_monitor.db'))
+DEMO_DB_PATH = str(ROOT / 'counter_monitor_demo.db')
+RECORDINGS_DIR = ROOT / "recordings"
+if not RECORDINGS_DIR.exists():
+    RECORDINGS_DIR = Path(r"d:\Python Projects\recordings")
+
+def get_playlist(path_or_dir):
+    if not path_or_dir:
+        return []
+    p = str(path_or_dir)
+    if os.path.isdir(p):
+        files = sorted([
+            os.path.join(p, f) for f in os.listdir(p)
+            if f.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.ts'))
+        ])
+        if files:
+            return files
+    if not os.path.exists(p) and os.path.isdir(os.path.dirname(p)):
+        parent = os.path.dirname(p)
+        prefix = os.path.basename(p)
+        matched = sorted([
+            os.path.join(parent, f) for f in os.listdir(parent)
+            if f.lower().startswith(prefix.lower()) and f.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.ts'))
+        ])
+        if matched:
+            return matched
+    if os.path.isfile(p):
+        return [p]
+    return [p]
+
+DEMO_COUNTER_RECORDINGS = {
+    'recep1': str(RECORDINGS_DIR / "reception1"),
+    'recep2': str(RECORDINGS_DIR / "reception2"),
+    'reception1': str(RECORDINGS_DIR / "reception1"),
+    'reception2': str(RECORDINGS_DIR / "reception2"),
+}
+MODE_STATE_FILE = ROOT / "feed_mode.json"
+CURRENT_FEED_MODE = 'live'
+if os.path.exists(MODE_STATE_FILE):
+    try:
+        with open(MODE_STATE_FILE, 'r') as fp:
+            CURRENT_FEED_MODE = json.load(fp).get('mode', 'live')
+    except Exception:
+        pass
+
+DB_PATH = DEMO_DB_PATH if CURRENT_FEED_MODE == 'demo' else LIVE_DB_PATH
 RTSP_BASE = os.environ.get('RTSP_BASE', 'rtsp://124.123.89.162:31554/live')
 DEVICE = os.environ.get('DEVICE', 'cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -69,28 +114,28 @@ DEFAULT_INITIAL_COUNTERS = [
         'name': 'Main Reception 1',
         'stream': 'recep1',
         'role': 'reception',
-        'capacity_threshold': 5,
+        'capacity_threshold': 7,
         'unattended_seconds': 60,
-        'service_time_mins': 2.5,
+        'service_time_mins': 2.0,
         'monitoring_start': '09:00',
         'monitoring_end': '17:00',
         'is_24_7': False,
-        'staff_zone': [[0.42, 0.15], [0.88, 0.15], [0.88, 0.70], [0.42, 0.70]],
-        'queue_zone': [[0.05, 0.28], [0.40, 0.28], [0.40, 0.95], [0.05, 0.95]],
+        'staff_zone': [[0.173, 0.922], [0.657, 0.448], [0.91, 0.629], [0.73, 1.0]],
+        'queue_zone': [[0.137, 0.589], [0.469, 0.395], [0.629, 0.423], [0.228, 0.719]],
     },
     {
         'id': 'recep2',
         'name': 'Main Reception 2',
         'stream': 'recep2',
         'role': 'reception',
-        'capacity_threshold': 5,
+        'capacity_threshold': 6,
         'unattended_seconds': 60,
         'service_time_mins': 2.5,
         'monitoring_start': '09:00',
         'monitoring_end': '17:00',
         'is_24_7': False,
-        'staff_zone': [[0.05, 0.58], [0.20, 0.48], [0.38, 0.72], [0.26, 0.82]],
-        'queue_zone': [[0.24, 0.43], [0.36, 0.30], [0.52, 0.50], [0.42, 0.66]],
+        'staff_zone': [[0.061, 0.405], [0.34, 0.204], [0.845, 0.997], [0.34, 1.0]],
+        'queue_zone': [[0.449, 0.224], [0.591, 0.154], [0.9, 0.448], [0.771, 0.573]],
     },
 ]
 
@@ -200,6 +245,9 @@ class Store:
             self.db.execute('CREATE INDEX IF NOT EXISTS idx_events_counter ON counter_events (counter_id, timestamp DESC)')
             self.db.execute('CREATE INDEX IF NOT EXISTS idx_trends_counter_ts ON counter_trends (counter_id, timestamp ASC)')
             self.db.commit()
+            if len(self.get_counters()) == 0:
+                for c in DEFAULT_INITIAL_COUNTERS:
+                    self.save_counter(c)
 
     def record_trend_sample(self, counter_id, queue_length, avg_wait_seconds, est_wait_mins, staff_present):
         with self.lock:
@@ -863,11 +911,20 @@ class CounterWorker(threading.Thread):
 
     def run(self):
         stream_url = self.config['stream']
-        if not stream_url.startswith('rtsp://') and not stream_url.startswith('http://'):
+        if CURRENT_FEED_MODE == 'demo':
+            counter_id = self.config.get('id', '')
+            stream_url = DEMO_COUNTER_RECORDINGS.get(counter_id, str(RECORDINGS_DIR / "reception1"))
+        elif not stream_url.startswith('rtsp://') and not stream_url.startswith('http://'):
             stream_url = f"{RTSP_BASE}/{stream_url}"
 
+        playlist = get_playlist(stream_url)
+        playlist_idx = 0
+        current_source = playlist[playlist_idx] if playlist else stream_url
+        is_file = (playlist and len(playlist) > 0 and os.path.isfile(playlist[0])) or os.path.isfile(current_source)
+
         while self.running:
-            cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+            current_source = playlist[playlist_idx] if (playlist and playlist_idx < len(playlist)) else stream_url
+            cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG)
             if not cap.isOpened():
                 with self.lock:
                     self.error = f"Stream offline ({self.config['stream']}), standby mode"
@@ -884,18 +941,27 @@ class CounterWorker(threading.Thread):
                                 self.latest_jpeg = fb_enc.tobytes()
                                 _, fb_raw = cv2.imencode('.jpg', fb_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
                                 self.latest_snapshot = fb_raw.tobytes()
-                time.sleep(10.0)
+                time.sleep(3.0 if is_file else 10.0)
                 continue
 
             with self.lock:
                 self.error = None
 
+            video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            frame_delay = 1.0 / max(10.0, min(30.0, video_fps)) if is_file else 0.0
             frame_times = collections.deque(maxlen=30)
 
             while self.running:
                 t0 = time.time()
                 ret, frame = cap.read()
                 if not ret or frame is None:
+                    if is_file and playlist:
+                        playlist_idx = (playlist_idx + 1) % len(playlist)
+                        current_source = playlist[playlist_idx]
+                        cap.release()
+                        cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG)
+                        time.sleep(0.02)
+                        continue
                     with self.lock:
                         self.error = "Stream disconnected, retrying..."
                     break
@@ -966,25 +1032,32 @@ class CounterWorker(threading.Thread):
                     serv_mins = self.service_time_mins
 
                 for tr in self.tracks:
-                    # Ground contact point: exact floor contact at shoe base for queue detection
+                    # Multi-point check for both staff and waiting queue:
+                    # When patients/visitors approach the counter, the counter desk blocks/occludes
+                    # their lower legs, or the YOLO box is cut off at the counter/waist level, or feet
+                    # land right at the edge of the polygon. We check foot, waist, center, and upper torso.
                     foot_x = (tr.bbox[0] + tr.bbox[2]) / 2.0
                     foot_y = float(tr.bbox[3]) - 2.0
                     pt_foot = (foot_x / w, foot_y / h)
 
-                    # Multi-point check for seated staff behind counter desk:
-                    # Staff are seated behind computer monitors and counter desks, so feet are often under
-                    # desks or cropped off-screen at bottom edge. We check foot, center, and upper torso.
                     center_y = (tr.bbox[1] + tr.bbox[3]) / 2.0
                     torso_y = tr.bbox[1] + 0.35 * (tr.bbox[3] - tr.bbox[1])
+                    waist_y = tr.bbox[1] + 0.65 * (tr.bbox[3] - tr.bbox[1])
                     pt_center = (foot_x / w, center_y / h)
                     pt_torso = (foot_x / w, torso_y / h)
+                    pt_waist = (foot_x / w, waist_y / h)
 
                     in_staff = (
                         _point_in_norm_poly(pt_foot, staff_poly) or
                         _point_in_norm_poly(pt_center, staff_poly) or
                         _point_in_norm_poly(pt_torso, staff_poly)
                     )
-                    in_queue = _point_in_norm_poly(pt_foot, queue_poly)
+                    in_queue = (
+                        _point_in_norm_poly(pt_foot, queue_poly) or
+                        _point_in_norm_poly(pt_waist, queue_poly) or
+                        _point_in_norm_poly(pt_center, queue_poly) or
+                        _point_in_norm_poly(pt_torso, queue_poly)
+                    )
 
                     if in_staff:
                         tr.role = 'staff'
@@ -995,9 +1068,9 @@ class CounterWorker(threading.Thread):
                             tr.entry_queue_time = now
                         tr.dwell_seconds = max(0.0, now - tr.entry_queue_time)
 
-                        # Dwell time filter: requires 2.0 seconds standing before being counted as a waiting patient!
-                        # Fleeting passersby walking past in the background take < 1.5s and are filtered out.
-                        if tr.dwell_seconds >= 2.0:
+                        # Dwell time filter: requires 1.2 seconds standing before being counted as a waiting patient!
+                        # Fleeting passersby walking past in the background are filtered out.
+                        if tr.dwell_seconds >= 1.2:
                             tr.role = 'queue'
                             persons_in_queue.append(tr)
                         else:
@@ -1087,6 +1160,9 @@ class CounterWorker(threading.Thread):
                     self.max_wait_seconds = round(max_dwell, 1)
                     self.status = status
                     self.current_unattended_seconds = unattend_duration
+
+                if is_file and frame_delay > 0:
+                    time.sleep(frame_delay)
 
             cap.release()
             time.sleep(1.0)
@@ -1242,6 +1318,72 @@ class CounterServer:
                         est_wait_m = round(q_len * w.service_time_mins, 1)
                         staff_p = w.staff_present
                     self.store.record_trend_sample(cid, q_len, avg_wait, est_wait_m, staff_p)
+
+    def get_feed_mode(self):
+        global CURRENT_FEED_MODE
+        return CURRENT_FEED_MODE
+
+    def set_feed_mode(self, mode=None):
+        global CURRENT_FEED_MODE, DB_PATH
+        if not mode:
+            mode = 'demo' if CURRENT_FEED_MODE == 'live' else 'live'
+        mode = 'demo' if str(mode).lower() == 'demo' else 'live'
+        
+        if mode == CURRENT_FEED_MODE:
+            return {'ok': True, 'mode': mode, 'active_db': os.path.basename(str(DB_PATH))}
+            
+        print(f"[COUNTER TRACKER] Switching feed mode: {CURRENT_FEED_MODE} -> {mode}")
+        CURRENT_FEED_MODE = mode
+        
+        try:
+            with open(MODE_STATE_FILE, 'w') as f:
+                json.dump({'mode': mode}, f)
+        except Exception:
+            pass
+            
+        # Stop existing workers
+        with self.lock:
+            for cid, w in list(self.workers.items()):
+                w.stop()
+            self.workers.clear()
+
+        if mode == 'demo':
+            DB_PATH = DEMO_DB_PATH
+            new_store = Store(DEMO_DB_PATH)
+            # Sync user-drawn zones and settings from live store into demo store
+            try:
+                for lc in self.store.get_counters():
+                    cid = lc['id']
+                    dc = next((c for c in new_store.get_counters() if c['id'] == cid), None)
+                    if dc:
+                        dc['staff_zone'] = lc['staff_zone']
+                        dc['queue_zone'] = lc['queue_zone']
+                        dc['capacity_threshold'] = lc.get('capacity_threshold', 5)
+                        dc['service_time_mins'] = lc.get('service_time_mins', 2.5)
+                        dc['unattended_seconds'] = lc.get('unattended_seconds', 60)
+                        dc['monitoring_start'] = lc.get('monitoring_start', '09:00')
+                        dc['monitoring_end'] = lc.get('monitoring_end', '17:00')
+                        dc['is_24_7'] = lc.get('is_24_7', False)
+                        new_store.save_counter(dc)
+                    else:
+                        new_store.save_counter(lc)
+            except Exception as e:
+                print("Counter zone sync note:", e)
+            self.store = new_store
+        else:
+            DB_PATH = LIVE_DB_PATH
+            new_store = Store(LIVE_DB_PATH)
+            self.store = new_store
+
+        # Start fresh workers
+        with self.lock:
+            counters = self.store.get_counters()
+            for c in counters:
+                worker = CounterWorker(c, self.store, self.model_pool)
+                self.workers[c['id']] = worker
+                worker.start()
+
+        return {'ok': True, 'mode': mode, 'active_db': os.path.basename(str(DB_PATH))}
 
     def get_state(self, counter_id=None, time_range='today'):
         with self.lock:
@@ -1470,6 +1612,12 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         path = url.path.rstrip('/')
 
+        if path in ('/api/feed-source', '/feed-source'):
+            return self._json(200, {
+                'mode': _SERVER.get_feed_mode(),
+                'active_db': os.path.basename(str(DB_PATH))
+            })
+
         if path == '/api/state':
             qs = parse_qs(url.query)
             cid = qs.get('counter_id', [None])[0]
@@ -1592,6 +1740,11 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode('utf-8'))
         except Exception:
             payload = {}
+
+        if path in ('/api/feed-source', '/feed-source', '/api/feed-source/toggle', '/feed-source/toggle'):
+            mode = payload.get('mode')
+            res = _SERVER.set_feed_mode(mode)
+            return self._json(200, res)
 
         if path == '/api/counters':
             success, res = _SERVER.add_counter(payload)

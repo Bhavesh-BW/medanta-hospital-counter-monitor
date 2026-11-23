@@ -28,6 +28,7 @@ export default function App() {
   });
   const [saveStatus, setSaveStatus] = useState('');
   const [hoveredTrendPoint, setHoveredTrendPoint] = useState(null);
+  const [feedSource, setFeedSource] = useState('live');
 
   // Fetch state periodically
   const fetchState = async () => {
@@ -40,6 +41,9 @@ export default function App() {
           setCounters(data.counters);
         }
       }
+      fetch(`${API_BASE}/api/feed-source`).then(r => r.ok ? r.json() : null).then(fs => {
+        if (fs?.mode) setFeedSource(fs.mode);
+      }).catch(() => null);
     } catch (e) {
       console.error("Failed to fetch state:", e);
     }
@@ -162,6 +166,25 @@ export default function App() {
     });
   };
 
+  const handleToggleFeedSource = async () => {
+    const nextMode = feedSource === 'demo' ? 'live' : 'demo';
+    try {
+      const res = await fetch(`${API_BASE}/api/feed-source`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: nextMode })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.mode) {
+        setFeedSource(data.mode);
+        fetchState();
+        fetchEvents();
+      }
+    } catch (e) {
+      console.error("Toggle feed source error:", e);
+    }
+  };
+
   const handleClearEvents = async () => {
     if (!window.confirm("Clear all recorded alert events from log?")) return;
     try {
@@ -261,6 +284,40 @@ export default function App() {
           </div>
         </div>
         <div className="header-actions">
+          {/* Feed Source Mode Toggle Pill */}
+          <button
+            type="button"
+            onClick={handleToggleFeedSource}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '7px',
+              padding: '6px 14px',
+              borderRadius: '8px',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              border: feedSource === 'demo' ? '1.5px solid #8b5cf6' : '1.5px solid #10b981',
+              backgroundColor: feedSource === 'demo' ? '#f5f3ff' : '#ecfdf5',
+              color: feedSource === 'demo' ? '#6d28d9' : '#047857',
+              boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+              transition: 'all 0.2s ease'
+            }}
+            title={feedSource === 'demo' ? "Currently playing Demo Recordings. Click to switch to Live RTSP Feeds." : "Currently streaming Live RTSP Feeds. Click to switch to Demo Recordings."}
+          >
+            <span style={{
+              width: '8px',
+              height: '8px',
+              borderRadius: '50%',
+              backgroundColor: feedSource === 'demo' ? '#7c3aed' : '#10b981',
+              boxShadow: feedSource === 'demo' ? '0 0 6px #7c3aed' : '0 0 6px #10b981'
+            }}></span>
+            <span>{feedSource === 'demo' ? '🎬 Demo Mode (Recordings)' : '🟢 Live Feeds Active'}</span>
+            <span style={{ fontSize: '10px', opacity: 0.7, textDecoration: 'underline', marginLeft: '2px' }}>
+              (Switch)
+            </span>
+          </button>
+
           <span style={{ fontSize: 13, color: '#475569', fontWeight: 600 }}>
             {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           </span>
