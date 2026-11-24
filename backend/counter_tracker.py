@@ -100,8 +100,8 @@ VIDEO_FALLBACK_FILE = 'reception1_20261102_181753_60s.mp4'
 # ── Mobile Phone Detection Configuration ──────────────────────────────────────
 # Restrict phone detection to staff zone polygon (True = ignore queue/lobby/visitors)
 PHONE_DETECTION_STAFF_ZONE_ONLY = os.environ.get('PHONE_DETECTION_STAFF_ZONE_ONLY', 'True').lower() in ('true', '1', 'yes')
-# Confidence threshold for using_phone class (0.35 filters weak false positives while catching true usage)
-PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.35'))
+# Confidence threshold for using_phone class (0.22 ensures robust staff phone usage detection without clipping true positives)
+PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.22'))
 # ──────────────────────────────────────────────────────────────────────────────
 
 MIME_TYPES = {
@@ -1048,106 +1048,106 @@ class CounterWorker(threading.Thread):
                                     'unattended_seconds': 0,
                                     'details': f"Queue length ({queue_count}) exceeded capacity threshold ({cap_thresh})"
                                 })
+                        else:
+                            status = 'normal'
                     else:
-                        status = 'normal'
+                        if self.unattended_start_time is None:
+                            self.unattended_start_time = now
+                        unattend_duration = int(now - self.unattended_start_time)
+
+                        if unattend_duration >= unattend_sec:
+                            status = 'unattended'
+                            if now - self.last_unattended_alert_sent > 90:
+                                self.last_unattended_alert_sent = now
+                                self.store.log_event({
+                                    'counter_id': self.config['id'],
+                                    'counter_name': self.config['name'],
+                                    'event_type': 'unattended_alert',
+                                    'severity': 'high',
+                                    'queue_length': queue_count,
+                                    'avg_wait_seconds': avg_dwell,
+                                    'staff_present': False,
+                                    'unattended_seconds': unattend_duration,
+                                    'details': f"Counter unattended for {unattend_duration}s with {queue_count} patient(s) waiting"
+                                })
+                        else:
+                            status = 'staff_away'
                 else:
-                    if self.unattended_start_time is None:
-                        self.unattended_start_time = now
-                    unattend_duration = int(now - self.unattended_start_time)
+                    self.unattended_start_time = None
+                    status = 'idle' if staff_present else 'idle_unstaffed'
 
-                    if unattend_duration >= unattend_sec:
-                        status = 'unattended'
-                        if now - self.last_unattended_alert_sent > 90:
-                            self.last_unattended_alert_sent = now
-                            self.store.log_event({
-                                'counter_id': self.config['id'],
-                                'counter_name': self.config['name'],
-                                'event_type': 'unattended_alert',
-                                'severity': 'high',
-                                'queue_length': queue_count,
-                                'avg_wait_seconds': avg_dwell,
-                                'staff_present': False,
-                                'unattended_seconds': unattend_duration,
-                                'details': f"Counter unattended for {unattend_duration}s with {queue_count} patient(s) waiting"
-                            })
-                    else:
-                        status = 'staff_away'
-            else:
-                self.unattended_start_time = None
-                status = 'idle' if staff_present else 'idle_unstaffed'
+                # ── Mobile Phone Detection: Staff Desk Monitoring Only ──
+                staff_using_phone = False
+                max_phone_conf = 0.0
 
-            # ── Mobile Phone Detection: Staff Desk Monitoring Only ──
-            staff_using_phone = False
-            max_phone_conf = 0.0
+                for pb, pc, _ in getattr(self, 'active_phone_detections', []):
+                    p_cx = (pb[0] + pb[2]) / 2.0
+                    p_cy = (pb[1] + pb[3]) / 2.0
+                    p_foot_y = float(pb[3]) - 2.0
+                    p_torso_y = pb[1] + 0.35 * (pb[3] - pb[1])
+                    norm_pt_center = (p_cx / w, p_cy / h)
+                    norm_pt_foot = (p_cx / w, p_foot_y / h)
+                    norm_pt_torso = (p_cx / w, p_torso_y / h)
 
-            for pb, pc, _ in getattr(self, 'active_phone_detections', []):
-                p_cx = (pb[0] + pb[2]) / 2.0
-                p_cy = (pb[1] + pb[3]) / 2.0
-                p_foot_y = float(pb[3]) - 2.0
-                p_torso_y = pb[1] + 0.35 * (pb[3] - pb[1])
-                norm_pt_center = (p_cx / w, p_cy / h)
-                norm_pt_foot = (p_cx / w, p_foot_y / h)
-                norm_pt_torso = (p_cx / w, p_torso_y / h)
+                    in_staff = (
+                        _point_in_norm_poly(norm_pt_center, staff_poly) or
+                        _point_in_norm_poly(norm_pt_foot, staff_poly) or
+                        _point_in_norm_poly(norm_pt_torso, staff_poly)
+                    )
 
-                in_staff = (
-                    _point_in_norm_poly(norm_pt_center, staff_poly) or
-                    _point_in_norm_poly(norm_pt_foot, staff_poly) or
-                    _point_in_norm_poly(norm_pt_torso, staff_poly)
-                )
+                    matched_track_role = None
+                    for tr in self.tracks:
+                        if tr.misses == 0 and _boxes_overlap(tr.bbox, pb):
+                            matched_track_role = tr.role
+                            break
 
-                matched_track_role = None
-                for tr in self.tracks:
-                    if tr.misses == 0 and _boxes_overlap(tr.bbox, pb):
-                        matched_track_role = tr.role
-                        break
+                    # Strictly detect phone usage by staff on duty (ignore customer queue phone usage)
+                    if in_staff or matched_track_role == 'staff':
+                        staff_using_phone = True
+                        max_phone_conf = max(max_phone_conf, pc)
 
-                # Strictly detect phone usage by staff on duty (ignore customer queue phone usage)
-                if in_staff or matched_track_role == 'staff':
-                    staff_using_phone = True
-                    max_phone_conf = max(max_phone_conf, pc)
+                self.phone_usage_active = staff_using_phone
 
-            self.phone_usage_active = staff_using_phone
+                if staff_using_phone and (now - self.last_phone_alert_sent > 30):
+                    self.last_phone_alert_sent = now
+                    self.store.log_event({
+                        'counter_id': self.config['id'],
+                        'counter_name': self.config['name'],
+                        'event_type': 'phone_usage_staff',
+                        'severity': 'high',
+                        'queue_length': queue_count,
+                        'avg_wait_seconds': avg_dwell,
+                        'staff_present': staff_present,
+                        'unattended_seconds': unattend_duration,
+                        'details': f"Staff member on duty detected using mobile phone at desk (Confidence: {max_phone_conf*100:.0f}%)"
+                    })
 
-            if staff_using_phone and (now - self.last_phone_alert_sent > 30):
-                self.last_phone_alert_sent = now
-                self.store.log_event({
-                    'counter_id': self.config['id'],
-                    'counter_name': self.config['name'],
-                    'event_type': 'phone_usage_staff',
-                    'severity': 'high',
-                    'queue_length': queue_count,
-                    'avg_wait_seconds': avg_dwell,
-                    'staff_present': staff_present,
-                    'unattended_seconds': unattend_duration,
-                    'details': f"Staff member on duty detected using mobile phone at desk (Confidence: {max_phone_conf*100:.0f}%)"
-                })
+                hud_frame = frame.copy()
+                self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring, is_file)
 
-            hud_frame = frame.copy()
-            self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring, is_file)
+                _, enc = cv2.imencode('.jpg', hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                jpeg_bytes = enc.tobytes()
 
-            _, enc = cv2.imencode('.jpg', hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            jpeg_bytes = enc.tobytes()
+                frame_times.append(time.time() - t0)
+                fps = round(1.0 / (sum(frame_times) / len(frame_times)), 1) if frame_times else 0.0
 
-            frame_times.append(time.time() - t0)
-            fps = round(1.0 / (sum(frame_times) / len(frame_times)), 1) if frame_times else 0.0
+                with self.lock:
+                    self.latest_jpeg = jpeg_bytes
+                    self.fps = fps
+                    self.scan_ms = round(scan_elapsed, 1)
+                    self.staff_present = staff_present
+                    self.staff_count = persons_in_staff
+                    self.queue_length = queue_count
+                    self.avg_wait_seconds = round(avg_dwell, 1)
+                    self.max_wait_seconds = round(max_dwell, 1)
+                    self.status = status
+                    self.current_unattended_seconds = unattend_duration
 
-            with self.lock:
-                self.latest_jpeg = jpeg_bytes
-                self.fps = fps
-                self.scan_ms = round(scan_elapsed, 1)
-                self.staff_present = staff_present
-                self.staff_count = persons_in_staff
-                self.queue_length = queue_count
-                self.avg_wait_seconds = round(avg_dwell, 1)
-                self.max_wait_seconds = round(max_dwell, 1)
-                self.status = status
-                self.current_unattended_seconds = unattend_duration
+                if is_file and frame_delay > 0:
+                    time.sleep(frame_delay)
 
-            if is_file and frame_delay > 0:
-                time.sleep(frame_delay)
-
-        cap.release()
-        time.sleep(1.0)
+            cap.release()
+            time.sleep(1.0)
 
     def _render_hud(self, img, staff_poly, queue_poly, tracks, staff_present, staff_count, queue_count, avg_dwell, status, unattend_sec, cap_thresh, serv_mins, in_monitoring=True, is_fallback=False):
         h, w = img.shape[:2]
