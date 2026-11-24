@@ -1,0 +1,10 @@
+# Medanta Hospital Counter & Phone Monitoring Dataset
+path: /content/dataset
+train: images/train
+val: images/val
+
+names:
+  0: using_phone
+  1: not_using_phone
+  2: table_phone
+  3: cash_machine
