@@ -20,6 +20,7 @@ import collections
 import json
 import os
 import pathlib
+from pathlib import Path
 import sqlite3
 import threading
 import time
@@ -202,7 +203,7 @@ class Store:
         pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         with self.lock:
             # Counters configuration table
             self.db.execute('''
