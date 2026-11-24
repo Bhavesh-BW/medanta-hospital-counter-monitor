@@ -100,8 +100,8 @@ VIDEO_FALLBACK_FILE = 'reception1_20261102_181753_60s.mp4'
 # ── Mobile Phone Detection Configuration ──────────────────────────────────────
 # Restrict phone detection to staff zone polygon (True = ignore queue/lobby/visitors)
 PHONE_DETECTION_STAFF_ZONE_ONLY = os.environ.get('PHONE_DETECTION_STAFF_ZONE_ONLY', 'True').lower() in ('true', '1', 'yes')
-# Confidence threshold for using_phone class (0.22 ensures robust staff phone usage detection without clipping true positives)
-PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.22'))
+# Confidence threshold for using_phone class (0.45 filters ambiguous postures and weak false positives)
+PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.45'))
 # ──────────────────────────────────────────────────────────────────────────────
 
 MIME_TYPES = {
