@@ -10,6 +10,7 @@ export default function App() {
   const [trends, setTrends] = useState([]);
   const [events, setEvents] = useState([]);
   const [eventFilter, setEventFilter] = useState('all');
+  const [modalSnapshot, setModalSnapshot] = useState(null);
   const [bigScreenCounter, setBigScreenCounter] = useState(null);
   const [activeZoneType, setActiveZoneType] = useState('staff_zone');
   const [isAddCounterOpen, setIsAddCounterOpen] = useState(false);
@@ -936,12 +937,13 @@ export default function App() {
               <th>Event</th>
               <th>Details</th>
               <th>Severity</th>
+              <th>Snapshot</th>
             </tr>
           </thead>
           <tbody>
             {events.filter(ev => eventFilter === 'all' || ev.counter_id === eventFilter).length === 0 ? (
               <tr>
-                <td colSpan="5" style={{ textAlign: 'center', color: '#94a3b8', padding: 18 }}>
+                <td colSpan="6" style={{ textAlign: 'center', color: '#94a3b8', padding: 18 }}>
                   No recent alert events logged. All counters operating normally.
                 </td>
               </tr>
@@ -998,6 +1000,25 @@ export default function App() {
                     >
                       {ev.severity}
                     </span>
+                  </td>
+                  <td>
+                    {ev.photo_url ? (
+                      <img
+                        src={`${API_BASE}${ev.crop_url || ev.photo_url}`}
+                        alt="Evidence snapshot"
+                        className="event-thumb"
+                        onClick={() => setModalSnapshot({
+                          url: `${API_BASE}${ev.photo_url}`,
+                          counter_name: ev.counter_name,
+                          event_type: ev.event_type,
+                          time: (timeRange !== 'today' && ev.date ? `${ev.date} ` : '') + (ev.full_time || ev.time || new Date(ev.timestamp).toLocaleTimeString()),
+                          details: ev.details
+                        })}
+                        title="Click to view full camera evidence snapshot"
+                      />
+                    ) : (
+                      <span style={{ color: '#94a3b8', fontSize: 11 }}>—</span>
+                    )}
                   </td>
                 </tr>
               ))
@@ -1162,6 +1183,48 @@ export default function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── INCIDENT SNAPSHOT EVIDENCE MODAL ── */}
+      {modalSnapshot && (
+        <div className="evidence-modal-backdrop" onClick={() => setModalSnapshot(null)}>
+          <div className="evidence-modal-card" onClick={e => e.stopPropagation()}>
+            <div className="evidence-modal-head">
+              <div>
+                <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#0f172a' }}>
+                  📸 Incident Evidence Snapshot · {modalSnapshot.counter_name}
+                </h3>
+                <small style={{ color: '#64748b', fontSize: 12, marginTop: 2, display: 'block' }}>
+                  {modalSnapshot.time} — {modalSnapshot.details}
+                </small>
+              </div>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => setModalSnapshot(null)}
+                style={{ fontWeight: 800 }}
+              >
+                ✕ Close
+              </button>
+            </div>
+            <div className="evidence-modal-body">
+              <img src={modalSnapshot.url} alt="Full Frame Incident Evidence" />
+            </div>
+            <div className="evidence-modal-foot">
+              <span style={{ fontSize: 12, color: '#475569', fontWeight: 600 }}>
+                Visual evidence with YOLO person bounding boxes, zones, dwell timer, and phone usage overlays.
+              </span>
+              <a
+                href={modalSnapshot.url}
+                target="_blank"
+                rel="noreferrer"
+                className="btn btn-secondary btn-sm"
+                style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+              >
+                Open Original Image ↗
+              </a>
+            </div>
           </div>
         </div>
       )}

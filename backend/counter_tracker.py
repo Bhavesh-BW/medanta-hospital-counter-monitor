@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -100,6 +101,8 @@ VIDEO_FALLBACK_FILE = 'reception1_20261102_181753_60s.mp4'
 # ── Mobile Phone Detection Configuration ──────────────────────────────────────
 # Restrict phone detection to staff zone polygon (True = ignore queue/lobby/visitors)
 PHONE_DETECTION_STAFF_ZONE_ONLY = os.environ.get('PHONE_DETECTION_STAFF_ZONE_ONLY', 'True').lower() in ('true', '1', 'yes')
+# Confidence threshold for using_phone class (0.22 ensures robust staff phone usage detection without clipping true positives)
+PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.22'))
 # Confidence threshold for using_phone class (0.45 filters ambiguous postures and weak false positives)
 PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.45'))
 # ──────────────────────────────────────────────────────────────────────────────
@@ -236,7 +239,7 @@ class Store:
                     self.db.execute(f"ALTER TABLE counters_config ADD COLUMN {col} {col_def}")
                 except Exception:
                     pass
-            # Events audit log table (telemetry only)
+            # Events audit log table (telemetry + incident snapshots)
             self.db.execute('''
                 CREATE TABLE IF NOT EXISTS counter_events (
                     id TEXT PRIMARY KEY,
@@ -249,9 +252,19 @@ class Store:
                     avg_wait_seconds REAL NOT NULL,
                     staff_present INTEGER NOT NULL,
                     unattended_seconds INTEGER DEFAULT 0,
-                    details TEXT NOT NULL
+                    details TEXT NOT NULL,
+                    photo BLOB,
+                    crop_photo BLOB
                 )
             ''')
+            for col, col_def in [
+                ('photo', "BLOB"),
+                ('crop_photo', "BLOB"),
+            ]:
+                try:
+                    self.db.execute(f"ALTER TABLE counter_events ADD COLUMN {col} {col_def}")
+                except Exception:
+                    pass
             # Live trend time-series table
             self.db.execute('''
                 CREATE TABLE IF NOT EXISTS counter_trends (
@@ -469,8 +482,8 @@ class Store:
     def log_event(self, event):
         with self.lock:
             self.db.execute('''
-                INSERT INTO counter_events (id, timestamp, counter_id, counter_name, event_type, severity, queue_length, avg_wait_seconds, staff_present, unattended_seconds, details)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO counter_events (id, timestamp, counter_id, counter_name, event_type, severity, queue_length, avg_wait_seconds, staff_present, unattended_seconds, details, photo, crop_photo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 str(uuid.uuid4()),
                 int(event.get('timestamp', time.time() * 1000)),
@@ -482,10 +495,20 @@ class Store:
                 float(event.get('avg_wait_seconds', 0.0)),
                 1 if event.get('staff_present', False) else 0,
                 int(event.get('unattended_seconds', 0)),
-                event.get('details', '')
+                event.get('details', ''),
+                event.get('photo'),
+                event.get('crop_photo')
             ))
             self.db.execute('DELETE FROM counter_events WHERE id NOT IN (SELECT id FROM counter_events ORDER BY timestamp DESC LIMIT 2000)')
             self.db.commit()
+
+    def get_event_photo(self, event_id, kind='photo'):
+        col = 'crop_photo' if kind == 'crop' else 'photo'
+        with self.lock:
+            cur = self.db.cursor()
+            cur.execute(f'SELECT {col} FROM counter_events WHERE id = ?', (event_id,))
+            row = cur.fetchone()
+            return row[0] if row and row[0] else None
 
     def clear_events(self, counter_id=None):
         with self.lock:
@@ -583,7 +606,7 @@ class Store:
         with self.lock:
             cur = self.db.cursor()
             start_ts, end_ts = _get_time_window(time_range)
-            query = 'SELECT id, timestamp, counter_id, counter_name, event_type, severity, queue_length, avg_wait_seconds, staff_present, unattended_seconds, details FROM counter_events WHERE timestamp >= ? AND timestamp <= ?'
+            query = 'SELECT id, timestamp, counter_id, counter_name, event_type, severity, queue_length, avg_wait_seconds, staff_present, unattended_seconds, details, (photo IS NOT NULL), (crop_photo IS NOT NULL) FROM counter_events WHERE timestamp >= ? AND timestamp <= ?'
             params = [start_ts, end_ts]
             if counter_id and counter_id != 'all':
                 query += ' AND counter_id = ?'
@@ -612,7 +635,9 @@ class Store:
                     'avg_wait_seconds': r[7],
                     'staff_present': bool(r[8]),
                     'unattended_seconds': r[9],
-                    'details': r[10]
+                    'details': r[10],
+                    'photo_url': f'/api/events/{r[0]}/photo' if (len(r) > 11 and r[11]) else None,
+                    'crop_url': f'/api/events/{r[0]}/crop' if (len(r) > 12 and r[12]) else None,
                 })
             return events
 
@@ -1035,19 +1060,6 @@ class CounterWorker(threading.Thread):
                         self.unattended_start_time = None
                         if queue_count > cap_thresh:
                             status = 'high_queue'
-                            if now - self.last_queue_alert_sent > 60:
-                                self.last_queue_alert_sent = now
-                                self.store.log_event({
-                                    'counter_id': self.config['id'],
-                                    'counter_name': self.config['name'],
-                                    'event_type': 'high_queue',
-                                    'severity': 'medium',
-                                    'queue_length': queue_count,
-                                    'avg_wait_seconds': avg_dwell,
-                                    'staff_present': True,
-                                    'unattended_seconds': 0,
-                                    'details': f"Queue length ({queue_count}) exceeded capacity threshold ({cap_thresh})"
-                                })
                         else:
                             status = 'normal'
                     else:
@@ -1057,19 +1069,6 @@ class CounterWorker(threading.Thread):
 
                         if unattend_duration >= unattend_sec:
                             status = 'unattended'
-                            if now - self.last_unattended_alert_sent > 90:
-                                self.last_unattended_alert_sent = now
-                                self.store.log_event({
-                                    'counter_id': self.config['id'],
-                                    'counter_name': self.config['name'],
-                                    'event_type': 'unattended_alert',
-                                    'severity': 'high',
-                                    'queue_length': queue_count,
-                                    'avg_wait_seconds': avg_dwell,
-                                    'staff_present': False,
-                                    'unattended_seconds': unattend_duration,
-                                    'details': f"Counter unattended for {unattend_duration}s with {queue_count} patient(s) waiting"
-                                })
                         else:
                             status = 'staff_away'
                 else:
@@ -1108,8 +1107,60 @@ class CounterWorker(threading.Thread):
 
                 self.phone_usage_active = staff_using_phone
 
+                hud_frame = frame.copy()
+                self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring, is_file)
+
+                _, enc = cv2.imencode('.jpg', hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                jpeg_bytes = enc.tobytes()
+
+                # Trigger incident alert events with annotated snapshot evidence
+                if in_monitoring and queue_count > 0:
+                    if staff_present and queue_count > cap_thresh:
+                        if now - self.last_queue_alert_sent > 60:
+                            self.last_queue_alert_sent = now
+                            self.store.log_event({
+                                'counter_id': self.config['id'],
+                                'counter_name': self.config['name'],
+                                'event_type': 'high_queue',
+                                'severity': 'medium',
+                                'queue_length': queue_count,
+                                'avg_wait_seconds': avg_dwell,
+                                'staff_present': True,
+                                'unattended_seconds': 0,
+                                'details': f"Queue length ({queue_count}) exceeded capacity threshold ({cap_thresh})",
+                                'photo': jpeg_bytes
+                            })
+                    elif not staff_present and unattend_duration >= unattend_sec:
+                        if now - self.last_unattended_alert_sent > 90:
+                            self.last_unattended_alert_sent = now
+                            self.store.log_event({
+                                'counter_id': self.config['id'],
+                                'counter_name': self.config['name'],
+                                'event_type': 'unattended_alert',
+                                'severity': 'high',
+                                'queue_length': queue_count,
+                                'avg_wait_seconds': avg_dwell,
+                                'staff_present': False,
+                                'unattended_seconds': unattend_duration,
+                                'details': f"Counter unattended for {unattend_duration}s with {queue_count} patient(s) waiting",
+                                'photo': jpeg_bytes
+                            })
+
                 if staff_using_phone and (now - self.last_phone_alert_sent > 30):
                     self.last_phone_alert_sent = now
+                    crop_photo = None
+                    for pb, pc, _ in getattr(self, 'active_phone_detections', []):
+                        pad = 30
+                        px1 = max(0, int(pb[0] - pad))
+                        py1 = max(0, int(pb[1] - pad))
+                        px2 = min(w, int(pb[2] + pad))
+                        py2 = min(h, int(pb[3] + pad))
+                        if px2 > px1 and py2 > py1:
+                            ok_c, enc_c = cv2.imencode('.jpg', frame[py1:py2, px1:px2], [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            if ok_c:
+                                crop_photo = enc_c.tobytes()
+                            break
+
                     self.store.log_event({
                         'counter_id': self.config['id'],
                         'counter_name': self.config['name'],
@@ -1119,14 +1170,10 @@ class CounterWorker(threading.Thread):
                         'avg_wait_seconds': avg_dwell,
                         'staff_present': staff_present,
                         'unattended_seconds': unattend_duration,
-                        'details': f"Staff member on duty detected using mobile phone at desk (Confidence: {max_phone_conf*100:.0f}%)"
+                        'details': f"Staff member on duty detected using mobile phone at desk (Confidence: {max_phone_conf*100:.0f}%)",
+                        'photo': jpeg_bytes,
+                        'crop_photo': crop_photo
                     })
-
-                hud_frame = frame.copy()
-                self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring, is_file)
-
-                _, enc = cv2.imencode('.jpg', hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                jpeg_bytes = enc.tobytes()
 
                 frame_times.append(time.time() - t0)
                 fps = round(1.0 / (sum(frame_times) / len(frame_times)), 1) if frame_times else 0.0
@@ -1642,6 +1689,20 @@ class Handler(BaseHTTPRequestHandler):
             tr = qs.get('time_range', ['today'])[0]
             events = _SERVER.store.get_events(limit=limit, counter_id=cid, severity=sev, time_range=tr)
             return self._json(200, events)
+
+        ev_match = re.match(r'^(?:/api)?/events/([a-zA-Z0-9_-]+)/(photo|crop)$', path)
+        if ev_match:
+            eid, kind = ev_match.group(1), ev_match.group(2)
+            blob = _SERVER.store.get_event_photo(eid, kind)
+            if not blob:
+                return self._json(404, {'error': 'No image found for event'})
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Cache-Control', 'private, max-age=3600')
+            self.send_header('Content-Length', str(len(blob)))
+            self.end_headers()
+            return self.wfile.write(blob)
 
         if path == '/api/hourly_trends':
             qs = parse_qs(url.query)
