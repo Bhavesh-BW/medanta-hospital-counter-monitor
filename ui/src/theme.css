@@ -834,3 +834,27 @@ body {
   justify-content: space-between;
   align-items: center;
 }
+
+/* ── Hourly Rush Timeline Horizontal Scroll ─────────────────── */
+.hourly-timeline-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #94a3b8 #f1f5f9;
+}
+
+.hourly-timeline-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+
+.hourly-timeline-scroll::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+
+.hourly-timeline-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+.hourly-timeline-scroll::-webkit-scrollbar-thumb:hover {
+  background: #0284c7;
+}

@@ -387,6 +387,31 @@ class Store:
                 if r[3]:
                     h_entry['staff_samples'] += 1
 
+            # When time_range is 'today', populate all operational hours of the day (08 AM to current hour / 10 PM)
+            if time_range == 'today':
+                now_ist_ts = int(time.time() * 1000) + ist_offset_ms
+                now_dt = time.gmtime(now_ist_ts / 1000)
+                cur_y, cur_m, cur_d = now_dt.tm_year, now_dt.tm_mon, now_dt.tm_mday
+                d_label = f"{cur_d:02d} {time.strftime('%b', now_dt)}"
+                max_h = max(now_dt.tm_hour, 22)
+                for h in range(8, max_h + 1):
+                    h_key = f"{cur_y}-{cur_m:02d}-{cur_d:02d} {h:02d}:00"
+                    h_12 = h % 12 or 12
+                    ampm = "AM" if h < 12 else "PM"
+                    h_lbl = f"{h_12:02d} {ampm}"
+                    if h_key not in hourly_map:
+                        hourly_map[h_key] = {
+                            'hour_key': h_key,
+                            'hour_label': h_lbl,
+                            'hour_num': h,
+                            'date_label': d_label,
+                            'samples': 0,
+                            'total_queue': 0,
+                            'max_queue': 0,
+                            'total_wait': 0.0,
+                            'staff_samples': 0
+                        }
+
             hours_list = []
             for k in sorted(hourly_map.keys()):
                 entry = hourly_map[k]

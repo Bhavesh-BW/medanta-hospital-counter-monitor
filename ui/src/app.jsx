@@ -39,6 +39,8 @@ export default function App() {
   const [viewMode, setViewMode] = useState('single'); // 'single' (focused selected counter) | 'grid' (all side-by-side)
   const [isStreamPlaying, setIsStreamPlaying] = useState(true);
   const [trendViewMode, setTrendViewMode] = useState('rolling'); // 'rolling' | 'hourly'
+  const hourlyScrollRef = useRef(null);
+  const [clearStatus, setClearStatus] = useState('');
   const [newCounterForm, setNewCounterForm] = useState({
     id: '',
     name: '',
@@ -232,13 +234,24 @@ export default function App() {
 
   const handleClearEvents = async () => {
     if (!window.confirm("Clear all recorded alert events from log?")) return;
+    setClearStatus('Clearing...');
     try {
       const res = await fetch(`${API_BASE}/api/events`, { method: 'DELETE' });
       if (res.ok) {
         setEvents([]);
+        setCategoryCounts({ all: 0, queue: 0, mobile: 0, anger: 0 });
+        setClearStatus('✅ Cleared!');
+        setTimeout(() => setClearStatus(''), 2500);
+        fetchState();
+        fetchCategoryCounts(selectedCounterId, timeRange);
+      } else {
+        alert("Failed to clear events from server.");
+        setClearStatus('');
       }
     } catch (e) {
       console.error("Failed to clear events:", e);
+      alert("Error clearing events: " + e.message);
+      setClearStatus('');
     }
   };
 
@@ -616,28 +629,73 @@ export default function App() {
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 180 }}>
-              {peakHour && (
-                <div
-                  style={{
-                    background: '#fffbeb',
-                    border: '1px solid #fde68a',
-                    borderRadius: 6,
-                    padding: '6px 10px',
-                    marginBottom: 8,
-                    fontSize: 11.5,
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                  }}
-                >
-                  <span style={{ color: '#92400e', fontWeight: 700 }}>
-                    🔥 Peak Busy Hour: {peakHour.hour_label} (Max {peakHour.max_queue} in queue, ~{peakHour.avg_wait_mins}m wait)
-                  </span>
-                  <span style={{ color: '#b45309', fontSize: 10.5, fontWeight: 600 }}>
-                    Coverage: {peakHour.staff_percentage}%
-                  </span>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8 }}>
+                {peakHour ? (
+                  <div
+                    style={{
+                      background: '#fffbeb',
+                      border: '1px solid #fde68a',
+                      borderRadius: 6,
+                      padding: '5px 10px',
+                      fontSize: 11,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      flex: 1,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    <span style={{ color: '#92400e', fontWeight: 700 }}>
+                      🔥 Peak: {peakHour.hour_label} (Max {peakHour.max_queue} in queue, ~{peakHour.avg_wait_mins}m wait)
+                    </span>
+                    <span style={{ color: '#b45309', fontSize: 10, fontWeight: 600 }}>
+                      Coverage: {peakHour.staff_percentage}%
+                    </span>
+                  </div>
+                ) : <div />}
+
+                {/* Left/Right Smooth Scroll Arrows */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                  <button
+                    type="button"
+                    onClick={() => { if (hourlyScrollRef.current) hourlyScrollRef.current.scrollBy({ left: -240, behavior: 'smooth' }); }}
+                    style={{
+                      border: '1px solid #cbd5e1',
+                      background: '#ffffff',
+                      borderRadius: 4,
+                      padding: '3px 8px',
+                      cursor: 'pointer',
+                      fontSize: 12,
+                      fontWeight: 800,
+                      color: '#475569',
+                      boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
+                    }}
+                    title="Scroll left to view earlier hours (08:00 AM onwards)"
+                  >
+                    ◀
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { if (hourlyScrollRef.current) hourlyScrollRef.current.scrollBy({ left: 240, behavior: 'smooth' }); }}
+                    style={{
+                      border: '1px solid #cbd5e1',
+                      background: '#ffffff',
+                      borderRadius: 4,
+                      padding: '3px 8px',
+                      cursor: 'pointer',
+                      fontSize: 12,
+                      fontWeight: 800,
+                      color: '#475569',
+                      boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
+                    }}
+                    title="Scroll right to view later hours (up to 10:00 PM)"
+                  >
+                    ▶
+                  </button>
                 </div>
-              )}
+              </div>
 
               {hourlyHours.length === 0 ? (
                 <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
@@ -645,12 +703,19 @@ export default function App() {
                 </div>
               ) : (
                 <div
+                  ref={hourlyScrollRef}
+                  className="hourly-timeline-scroll"
+                  onWheel={(e) => {
+                    if (e.deltaY !== 0) {
+                      e.currentTarget.scrollLeft += (e.deltaY * 1.5);
+                    }
+                  }}
                   style={{
                     display: 'flex',
                     gap: 8,
                     overflowX: 'auto',
                     padding: '4px 2px 10px 2px',
-                    scrollbarWidth: 'thin',
+                    scrollBehavior: 'smooth',
                   }}
                 >
                   {hourlyHours.map((h, i) => {
@@ -710,7 +775,7 @@ export default function App() {
                 </div>
               )}
               <div style={{ fontSize: 10.5, color: '#64748b', textAlign: 'center', marginTop: 'auto' }}>
-                ↔ Scroll horizontally across operational hours to review peak rush periods (IST)
+                ↔ Scroll horizontally or use ◀ ▶ buttons to review all hours of the day (08:00 AM - 10:00 PM IST)
               </div>
             </div>
           )}
@@ -965,11 +1030,20 @@ export default function App() {
             </div>
             <button
               className="btn btn-secondary btn-sm"
-              style={{ fontSize: 11.5, padding: '4px 10px', color: '#dc2626', borderColor: '#fca5a5' }}
+              style={{
+                fontSize: 11.5,
+                padding: '4px 10px',
+                color: clearStatus.includes('✅') ? '#16a34a' : '#dc2626',
+                borderColor: clearStatus.includes('✅') ? '#86efac' : '#fca5a5',
+                fontWeight: 700,
+                background: clearStatus.includes('✅') ? '#f0fdf4' : '#ffffff',
+                transition: 'all 0.2s ease',
+              }}
               onClick={handleClearEvents}
+              disabled={clearStatus === 'Clearing...'}
               title="Clear all recorded alert events from database"
             >
-              🗑️ Clear Log
+              {clearStatus ? clearStatus : '🗑️ Clear Log'}
             </button>
           </div>
         </div>
