@@ -191,7 +191,7 @@ body {
 /* ── 3-COLUMN MIDDLE SECTION (Matching Screenshot) ── */
 .middle-3col-grid {
   display: grid;
-  grid-template-columns: 1.1fr 1fr 1.25fr;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1.25fr);
   gap: 18px;
   margin-bottom: 22px;
 }
@@ -204,6 +204,9 @@ body {
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .panel-header {

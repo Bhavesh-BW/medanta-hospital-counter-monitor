@@ -628,7 +628,7 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 180 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 180, minWidth: 0, maxWidth: '100%', overflow: 'hidden' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8 }}>
                 {peakHour ? (
                   <div
@@ -716,6 +716,9 @@ export default function App() {
                     overflowX: 'auto',
                     padding: '4px 2px 10px 2px',
                     scrollBehavior: 'smooth',
+                    width: '100%',
+                    maxWidth: '100%',
+                    minWidth: 0,
                   }}
                 >
                   {hourlyHours.map((h, i) => {
