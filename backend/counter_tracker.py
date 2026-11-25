@@ -98,13 +98,15 @@ USE_VIDEO_FALLBACK = os.environ.get('USE_VIDEO_FALLBACK', 'False').lower() in ('
 # Each counter can have its own file; if not found, falls back to this default.
 VIDEO_FALLBACK_FILE = 'reception1_20261102_181753_60s.mp4'
 
-# ── Mobile Phone Detection Configuration ──────────────────────────────────────
+# ── Mobile Phone & Customer Agitation Detection Configuration ─────────────────
 # Restrict phone detection to staff zone polygon (True = ignore queue/lobby/visitors)
 PHONE_DETECTION_STAFF_ZONE_ONLY = os.environ.get('PHONE_DETECTION_STAFF_ZONE_ONLY', 'True').lower() in ('true', '1', 'yes')
-# Confidence threshold for using_phone class (0.22 ensures robust staff phone usage detection without clipping true positives)
-PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.22'))
-# Confidence threshold for using_phone class (0.45 filters ambiguous postures and weak false positives)
-PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.45'))
+# Confidence threshold for using_phone class (0.70 high threshold to eliminate false positives)
+PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.70'))
+# Confidence threshold for customer anger & agitation (0.55 high threshold to prevent neutral face misclassifications)
+ANGER_THRESHOLD = float(os.environ.get('ANGER_THRESHOLD', '0.55'))
+# Emotion classes for AffectNet-7 DDAMFN model
+EMOTION_LABELS = ["neutral", "happy", "sad", "surprise", "fear", "disgust", "anger"]
 # ──────────────────────────────────────────────────────────────────────────────
 
 MIME_TYPES = {
@@ -602,7 +604,7 @@ class Store:
                 'total_events': tot_events
             }
 
-    def get_events(self, limit=100, counter_id=None, severity=None, time_range='today'):
+    def get_events(self, limit=100, counter_id=None, severity=None, time_range='today', category=None):
         with self.lock:
             cur = self.db.cursor()
             start_ts, end_ts = _get_time_window(time_range)
@@ -614,6 +616,13 @@ class Store:
             if severity and severity != 'all':
                 query += ' AND severity = ?'
                 params.append(severity)
+            if category and category != 'all':
+                if category == 'queue':
+                    query += " AND event_type IN ('high_queue', 'unattended_alert')"
+                elif category == 'mobile':
+                    query += " AND event_type LIKE '%phone%'"
+                elif category == 'anger':
+                    query += " AND event_type IN ('anger_detected', 'customer_agitation')"
             query += ' ORDER BY timestamp DESC LIMIT ?'
             params.append(limit)
 
@@ -640,6 +649,29 @@ class Store:
                     'crop_url': f'/api/events/{r[0]}/crop' if (len(r) > 12 and r[12]) else None,
                 })
             return events
+
+    def get_event_category_counts(self, counter_id=None, time_range='today'):
+        with self.lock:
+            cur = self.db.cursor()
+            start_ts, end_ts = _get_time_window(time_range)
+            query = 'SELECT event_type, count(*) FROM counter_events WHERE timestamp >= ? AND timestamp <= ?'
+            params = [start_ts, end_ts]
+            if counter_id and counter_id != 'all':
+                query += ' AND counter_id = ?'
+                params.append(counter_id)
+            query += ' GROUP BY event_type'
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            counts = {'all': 0, 'queue': 0, 'mobile': 0, 'anger': 0}
+            for etype, cnt in rows:
+                counts['all'] += cnt
+                if etype in ('high_queue', 'unattended_alert'):
+                    counts['queue'] += cnt
+                elif 'phone' in etype:
+                    counts['mobile'] += cnt
+                elif etype in ('anger_detected', 'customer_agitation'):
+                    counts['anger'] += cnt
+            return counts
 
 
 # ── Centroid & IoU Multi-Person Tracker ─────────────────────────────────────
@@ -767,6 +799,9 @@ class CounterWorker(threading.Thread):
         self.frame_idx = 0
         self.active_phone_detections = []
         self.phone_usage_active = False
+        self.active_anger_detections = []
+        self.last_anger_alert_sent = 0
+        self.anger_active = False
 
     def is_in_monitoring_hours(self):
         if self.is_24_7:
@@ -1107,6 +1142,68 @@ class CounterWorker(threading.Thread):
 
                 self.phone_usage_active = staff_using_phone
 
+                # ── Customer Agitation & Anger Emotion Detection (AffecNet-7 + YuNet) ──
+                fresh_anger_dets = []
+                if getattr(self.model_pool, 'face_detector', None) is not None and getattr(self.model_pool, 'fer_model', None) is not None:
+                    if (self.frame_idx % 3 == 0) or len(self.active_anger_detections) == 0:
+                        # Scan candidate persons waiting at counter or in queue
+                        target_tracks = [t for t in self.tracks if t.misses == 0 and t.role in ('queue', 'entering_queue', 'other')]
+                        for tr in target_tracks:
+                            tx1, ty1, tx2, ty2 = tr.bbox
+                            px1 = max(0, tx1)
+                            py1 = max(0, ty1)
+                            px2 = min(w, tx2)
+                            py2 = min(h, ty2)
+                            pw = px2 - px1
+                            ph = py2 - py1
+                            if pw < 30 or ph < 30:
+                                continue
+
+                            person_crop = frame[py1:py2, px1:px2]
+                            try:
+                                self.model_pool.face_detector.setInputSize((pw, ph))
+                                _, faces = self.model_pool.face_detector.detect(person_crop)
+                                if faces is not None and len(faces) > 0:
+                                    for face in faces:
+                                        f_conf = float(face[-1])
+                                        if f_conf < 0.50:
+                                            continue
+                                        fx, fy, fw, fh = face[0:4].astype(int)
+                                        gx1 = max(0, px1 + fx)
+                                        gy1 = max(0, py1 + fy)
+                                        gx2 = min(w, px1 + fx + fw)
+                                        gy2 = min(h, py1 + fy + fh)
+                                        if (gx2 - gx1) < 20 or (gy2 - gy1) < 20:
+                                            continue
+
+                                        face_crop = frame[gy1:gy2, gx1:gx2]
+                                        f_resized = cv2.resize(face_crop, (112, 112))
+                                        f_rgb = cv2.cvtColor(f_resized, cv2.COLOR_BGR2RGB)
+                                        f_tensor = torch.from_numpy(f_rgb).permute(2, 0, 1).float() / 255.0
+                                        f_tensor = ((f_tensor - 0.5) / 0.5).unsqueeze(0)
+                                        with torch.no_grad():
+                                            f_logits = self.model_pool.fer_model(f_tensor)
+                                            if isinstance(f_logits, tuple):
+                                                f_logits = f_logits[0]
+                                            f_probs = torch.softmax(f_logits, dim=1).squeeze(0).cpu().numpy()
+                                        anger_score = float(f_probs[6])  # 6 = anger
+                                        dom_idx = int(np.argmax(f_probs))
+                                        dom_label = EMOTION_LABELS[dom_idx]
+                                        dom_conf = float(f_probs[dom_idx])
+
+                                        # Strict threshold (>= 0.55 / above 50% to prevent false positives)
+                                        if anger_score >= ANGER_THRESHOLD or (dom_label == 'anger' and dom_conf >= ANGER_THRESHOLD):
+                                            fresh_anger_dets.append(([gx1, gy1, gx2, gy2], anger_score, now, tr.track_id))
+                            except Exception:
+                                pass
+                        self.active_anger_detections = fresh_anger_dets
+                    else:
+                        self.active_anger_detections = [ad for ad in self.active_anger_detections if (now - ad[2]) < 1.5]
+                else:
+                    self.active_anger_detections = []
+
+                self.anger_active = len(self.active_anger_detections) > 0
+
                 hud_frame = frame.copy()
                 self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring, is_file)
 
@@ -1171,6 +1268,37 @@ class CounterWorker(threading.Thread):
                         'staff_present': staff_present,
                         'unattended_seconds': unattend_duration,
                         'details': f"Staff member on duty detected using mobile phone at desk (Confidence: {max_phone_conf*100:.0f}%)",
+                        'photo': jpeg_bytes,
+                        'crop_photo': crop_photo
+                    })
+
+                # Trigger customer agitation / anger alert event
+                if self.anger_active and (now - self.last_anger_alert_sent > 45):
+                    self.last_anger_alert_sent = now
+                    crop_photo = None
+                    max_anger_conf = max([ad[1] for ad in self.active_anger_detections]) if self.active_anger_detections else ANGER_THRESHOLD
+                    for ab, ac, _, _ in getattr(self, 'active_anger_detections', []):
+                        pad = 30
+                        ax1 = max(0, int(ab[0] - pad))
+                        ay1 = max(0, int(ab[1] - pad))
+                        ax2 = min(w, int(ab[2] + pad))
+                        ay2 = min(h, int(ab[3] + pad))
+                        if ax2 > ax1 and ay2 > ay1:
+                            ok_c, enc_c = cv2.imencode('.jpg', frame[ay1:ay2, ax1:ax2], [cv2.IMWRITE_JPEG_QUALITY, 90])
+                            if ok_c:
+                                crop_photo = enc_c.tobytes()
+                            break
+
+                    self.store.log_event({
+                        'counter_id': self.config['id'],
+                        'counter_name': self.config['name'],
+                        'event_type': 'anger_detected',
+                        'severity': 'high',
+                        'queue_length': queue_count,
+                        'avg_wait_seconds': avg_dwell,
+                        'staff_present': staff_present,
+                        'unattended_seconds': unattend_duration,
+                        'details': f"Customer agitation / angry facial expression detected at counter (Confidence: {max_anger_conf*100:.0f}%)",
                         'photo': jpeg_bytes,
                         'crop_photo': crop_photo
                     })
@@ -1267,12 +1395,23 @@ class CounterWorker(threading.Thread):
             cv2.rectangle(img, (pb[0], max(0, pb[1] - th - 6)), (pb[0] + tw + 8, pb[1]), COLOR_PHONE, -1)
             cv2.putText(img, phone_lbl, (pb[0] + 4, max(th + 2, pb[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
 
+        # Draw Customer Agitation / Anger Face Bounding Boxes
+        for ab, ac, _, _ in getattr(self, 'active_anger_detections', []):
+            cv2.rectangle(img, (ab[0], ab[1]), (ab[2], ab[3]), (0, 0, 240), 2)
+            anger_lbl = f"AGITATED CUSTOMER {int(ac * 100)}%"
+            (tw, th), _ = cv2.getTextSize(anger_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(img, (ab[0], max(0, ab[1] - th - 6)), (ab[0] + tw + 8, ab[1]), (0, 0, 240), -1)
+            cv2.putText(img, anger_lbl, (ab[0] + 4, max(th + 2, ab[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
         header_h = 40
         cv2.rectangle(img, (0, 0), (w, header_h), COLOR_BG_DARK, -1)
         cv2.putText(img, f"{self.config['name'].upper()}", (14, 27), cv2.FONT_HERSHEY_DUPLEX, 0.60, (240, 240, 240), 1, cv2.LINE_AA)
 
         if getattr(self, 'phone_usage_active', False):
             cv2.putText(img, "PHONE IN USE", (w - 470, 26), cv2.FONT_HERSHEY_DUPLEX, 0.55, COLOR_PHONE, 1, cv2.LINE_AA)
+
+        if getattr(self, 'anger_active', False):
+            cv2.putText(img, "AGITATION ALERT", (w - 660, 26), cv2.FONT_HERSHEY_DUPLEX, 0.55, (0, 0, 240), 1, cv2.LINE_AA)
 
         queue_text = f"QUEUE: {queue_count} / {cap_thresh}"
         cv2.putText(img, queue_text, (w // 2 - 90, 26), cv2.FONT_HERSHEY_DUPLEX, 0.55, (40, 220, 255) if queue_count <= cap_thresh else (40, 60, 255), 1, cv2.LINE_AA)
@@ -1342,6 +1481,46 @@ class ModelPool:
         else:
             self.phone_model = None
             print("Notice: best_v2.pt/best.pt not found, mobile phone detection disabled.")
+
+        # YuNet Face Detector for Customer Interaction/Queue Area
+        yunet_path = MODELS / 'face_detection_yunet_2023mar.onnx'
+        if not yunet_path.exists():
+            yunet_path = ROOT / 'face_detection_yunet_2023mar.onnx'
+        if yunet_path.exists():
+            try:
+                self.face_detector = cv2.FaceDetectorYN.create(
+                    model=str(yunet_path),
+                    config="",
+                    input_size=(320, 320),
+                    score_threshold=0.50,
+                    nms_threshold=0.3,
+                    top_k=5000,
+                    backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
+                    target_id=cv2.dnn.DNN_TARGET_CPU
+                )
+                print(f"YuNet face detector loaded successfully from {yunet_path}!")
+            except Exception as e:
+                self.face_detector = None
+                print(f"Notice: Failed to load YuNet face detector: {e}")
+        else:
+            self.face_detector = None
+            print("Notice: YuNet face detector model not found.")
+
+        # DDAMFN Facial Expression (AffectNet-7) Emotion Model
+        fer_path = MODELS / 'affecnet7.script'
+        if not fer_path.exists():
+            fer_path = ROOT / 'affecnet7.script'
+        if fer_path.exists():
+            try:
+                self.fer_model = torch.jit.load(str(fer_path), map_location="cpu")
+                self.fer_model.eval()
+                print(f"AffecNet-7 expression model loaded successfully from {fer_path}!")
+            except Exception as e:
+                self.fer_model = None
+                print(f"Notice: Failed to load AffecNet-7 expression model: {e}")
+        else:
+            self.fer_model = None
+            print("Notice: affecnet7.script expression model not found.")
 
 
 # ── Server State & Manager ───────────────────────────────────────────────────
@@ -1498,6 +1677,7 @@ class CounterServer:
                     'is_24_7': getattr(w, 'is_24_7', False),
                     'phone_staff_only': getattr(w, 'phone_staff_only', True),
                     'phone_usage_active': getattr(w, 'phone_usage_active', False),
+                    'anger_active': getattr(w, 'anger_active', False),
                 }
 
             # Precompute KPIs per counter
@@ -1580,6 +1760,7 @@ class CounterServer:
                 'workers': worker_states,
                 'counters': self.store.get_counters(),
                 'hourly_rush': hourly_rush,
+                'event_counts': self.store.get_event_category_counts(counter_id=target_cid, time_range=time_range),
             }
 
     def update_counter_zones(self, counter_id, new_zones):
@@ -1686,9 +1867,17 @@ class Handler(BaseHTTPRequestHandler):
             limit = int(qs.get('limit', [100])[0])
             cid = qs.get('counter_id', [None])[0]
             sev = qs.get('severity', [None])[0]
+            cat = qs.get('category', [None])[0]
             tr = qs.get('time_range', ['today'])[0]
-            events = _SERVER.store.get_events(limit=limit, counter_id=cid, severity=sev, time_range=tr)
+            events = _SERVER.store.get_events(limit=limit, counter_id=cid, severity=sev, time_range=tr, category=cat)
             return self._json(200, events)
+
+        if path == '/api/event_counts':
+            qs = parse_qs(url.query)
+            cid = qs.get('counter_id', [None])[0]
+            tr = qs.get('time_range', ['today'])[0]
+            counts = _SERVER.store.get_event_category_counts(counter_id=cid, time_range=tr)
+            return self._json(200, counts)
 
         ev_match = re.match(r'^(?:/api)?/events/([a-zA-Z0-9_-]+)/(photo|crop)$', path)
         if ev_match:
