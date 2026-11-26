@@ -101,10 +101,8 @@ VIDEO_FALLBACK_FILE = 'reception1_20261102_181753_60s.mp4'
 # ── Mobile Phone Detection Configuration ──────────────────────────────────────
 # Restrict phone detection to staff zone polygon (True = ignore queue/lobby/visitors)
 PHONE_DETECTION_STAFF_ZONE_ONLY = os.environ.get('PHONE_DETECTION_STAFF_ZONE_ONLY', 'True').lower() in ('true', '1', 'yes')
-# Confidence threshold for using_phone class (0.22 ensures robust staff phone usage detection without clipping true positives)
-PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.22'))
-# Confidence threshold for using_phone class (0.45 filters ambiguous postures and weak false positives)
-PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.45'))
+# Confidence threshold for using_phone class (0.25 ensures robust staff phone usage detection without clipping true positives)
+PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.25'))
 # ──────────────────────────────────────────────────────────────────────────────
 
 MIME_TYPES = {
@@ -1327,12 +1325,8 @@ class ModelPool:
         self.model = YOLO(str(model_path))
         print("YOLO person detector loaded successfully!")
 
-        # Mobile Phone Detection Model (best_v2.pt or best.pt)
-        phone_model_path = MODELS / 'best_v2.pt'
-        if not phone_model_path.exists():
-            phone_model_path = ROOT / 'best_v2.pt'
-        if not phone_model_path.exists():
-            phone_model_path = MODELS / 'best.pt'
+        # Mobile Phone Detection Model (best.pt only)
+        phone_model_path = MODELS / 'best.pt'
         if not phone_model_path.exists():
             phone_model_path = ROOT / 'best.pt'
         if phone_model_path.exists():
@@ -1341,7 +1335,7 @@ class ModelPool:
             print(f"Mobile Phone detector loaded successfully! Classes: {self.phone_model.names}")
         else:
             self.phone_model = None
-            print("Notice: best_v2.pt/best.pt not found, mobile phone detection disabled.")
+            print("Notice: best.pt not found, mobile phone detection disabled.")
 
 
 # ── Server State & Manager ───────────────────────────────────────────────────
