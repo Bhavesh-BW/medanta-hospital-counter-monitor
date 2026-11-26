@@ -740,6 +740,8 @@ export default function App() {
                         <span className="badge" style={{ background: '#f1f5f9', color: '#64748b', border: '1px solid #e2e8f0' }}>Closed (Off-Shift)</span>
                       ) : isUnattended ? (
                         <span className="badge badge-unattended">Unattended</span>
+                      ) : w.anger_detected ? (
+                        <span className="badge" style={{ background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', fontWeight: 700 }}>😠 Angry Customer</span>
                       ) : w.phone_usage_active ? (
                         <span className="badge" style={{ background: '#fdf2f8', color: '#db2777', border: '1px solid #fbcfe8', fontWeight: 700 }}>📱 Phone in Use</span>
                       ) : w.staff_present ? (
@@ -967,6 +969,22 @@ export default function App() {
                     )}
                     {ev.event_type === 'presence_restored' && (
                       <span className="badge badge-normal">Normal (Staff Restored)</span>
+                    )}
+                    {ev.event_type === 'customer_anger' && (
+                      <span
+                        className="badge"
+                        style={{
+                          background: '#fef2f2',
+                          color: '#dc2626',
+                          border: '1px solid #fecaca',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 4,
+                          fontWeight: 700,
+                        }}
+                      >
+                        😠 Angry Customer
+                      </span>
                     )}
                     {(ev.event_type === 'phone_usage' || ev.event_type === 'phone_usage_staff' || ev.event_type === 'phone_usage_queue') && (
                       <span

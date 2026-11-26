@@ -36,6 +36,11 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+try:
+    from helpers.anger_detector import CustomerAngerDetector
+except ImportError:
+    from backend.helpers.anger_detector import CustomerAngerDetector
+
 ROOT = pathlib.Path(__file__).resolve().parent
 MODELS = ROOT / 'models'
 DIST_DIR = ROOT / 'dist'
@@ -105,6 +110,16 @@ PHONE_DETECTION_STAFF_ZONE_ONLY = os.environ.get('PHONE_DETECTION_STAFF_ZONE_ONL
 PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.22'))
 # Confidence threshold for using_phone class (0.45 filters ambiguous postures and weak false positives)
 PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.45'))
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Customer Anger Detection Configuration (Pluggable) ──────────────────────────
+# Restrict emotion detection strictly to customer queue zone (True)
+ANGER_DETECTION_CUSTOMER_ZONE_ONLY = os.environ.get('ANGER_DETECTION_CUSTOMER_ZONE_ONLY', 'True').lower() in ('true', '1', 'yes')
+# Pluggable toggle for customer anger detection
+ENABLE_ANGER_DETECTION = os.environ.get('ENABLE_ANGER_DETECTION', 'True').lower() in ('true', '1', 'yes')
+# Confidence threshold for customer anger (0.45 default from AffectNet-7)
+ANGER_CONFIDENCE_THRESHOLD = float(os.environ.get('ANGER_CONFIDENCE_THRESHOLD', '0.45'))
+COLOR_ANGER = (40, 40, 240)          # Red for customer anger
 # ──────────────────────────────────────────────────────────────────────────────
 
 MIME_TYPES = {
@@ -768,6 +783,11 @@ class CounterWorker(threading.Thread):
         self.active_phone_detections = []
         self.phone_usage_active = False
 
+        self.last_anger_alert_sent = 0
+        self.active_anger_detections = []
+        self.anger_detected_active = False
+        self.max_anger_conf = 0.0
+
     def is_in_monitoring_hours(self):
         if self.is_24_7:
             return True, "24/7 (Always Active)"
@@ -1107,6 +1127,42 @@ class CounterWorker(threading.Thread):
 
                 self.phone_usage_active = staff_using_phone
 
+                # ── Pluggable Customer Anger Detection: Customer Queue Zone Only ──
+                customer_angry = False
+                max_anger_conf = 0.0
+
+                if getattr(self.model_pool, 'anger_detector', None) and self.model_pool.anger_detector.is_ready:
+                    # Periodically run emotion detection on customer queue occupants (every 3 frames)
+                    if self.frame_idx % 3 == 0 or len(self.active_anger_detections) == 0:
+                        fresh_anger_dets = []
+                        # Strictly target tracks inside customer queue zone
+                        customer_queue_tracks = [
+                            tr for tr in self.tracks
+                            if tr.misses == 0 and tr.role in ('queue', 'entering_queue')
+                        ]
+                        for ctr in customer_queue_tracks:
+                            res = self.model_pool.anger_detector.analyze_person_crop(frame, ctr.bbox)
+                            if res and res.get('is_anger'):
+                                fresh_anger_dets.append((
+                                    res['face_bbox'],
+                                    res['anger_score'],
+                                    res['expression'],
+                                    res.get('face_crop'),
+                                    ctr.track_id,
+                                    now
+                                ))
+                        self.active_anger_detections = fresh_anger_dets
+                    else:
+                        # Decay old anger detections after 1.5 seconds
+                        self.active_anger_detections = [ad for ad in self.active_anger_detections if (now - ad[5]) < 1.5]
+
+                    if self.active_anger_detections:
+                        customer_angry = True
+                        max_anger_conf = max(ad[1] for ad in self.active_anger_detections)
+
+                self.anger_detected_active = customer_angry
+                self.max_anger_conf = max_anger_conf
+
                 hud_frame = frame.copy()
                 self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring, is_file)
 
@@ -1171,6 +1227,31 @@ class CounterWorker(threading.Thread):
                         'staff_present': staff_present,
                         'unattended_seconds': unattend_duration,
                         'details': f"Staff member on duty detected using mobile phone at desk (Confidence: {max_phone_conf*100:.0f}%)",
+                        'photo': jpeg_bytes,
+                        'crop_photo': crop_photo
+                    })
+
+                if customer_angry and (now - self.last_anger_alert_sent > 30):
+                    self.last_anger_alert_sent = now
+                    crop_photo = None
+                    if self.active_anger_detections:
+                        best_det = max(self.active_anger_detections, key=lambda d: d[1])
+                        face_crop = best_det[3]
+                        if face_crop is not None and face_crop.size > 0:
+                            ok_c, enc_c = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            if ok_c:
+                                crop_photo = enc_c.tobytes()
+
+                    self.store.log_event({
+                        'counter_id': self.config['id'],
+                        'counter_name': self.config['name'],
+                        'event_type': 'customer_anger',
+                        'severity': 'high',
+                        'queue_length': queue_count,
+                        'avg_wait_seconds': avg_dwell,
+                        'staff_present': staff_present,
+                        'unattended_seconds': unattend_duration,
+                        'details': f"Angry customer detected in queue (Confidence: {max_anger_conf*100:.0f}%)",
                         'photo': jpeg_bytes,
                         'crop_photo': crop_photo
                     })
@@ -1267,9 +1348,20 @@ class CounterWorker(threading.Thread):
             cv2.rectangle(img, (pb[0], max(0, pb[1] - th - 6)), (pb[0] + tw + 8, pb[1]), COLOR_PHONE, -1)
             cv2.putText(img, phone_lbl, (pb[0] + 4, max(th + 2, pb[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
 
+        # Draw Customer Anger Bounding Boxes (Customer Queue Zone Only)
+        for fb, fconf, expr, _, tid, _ in getattr(self, 'active_anger_detections', []):
+            cv2.rectangle(img, (fb[0], fb[1]), (fb[2], fb[3]), COLOR_ANGER, 2)
+            anger_lbl = f"ANGRY {int(fconf * 100)}%"
+            (tw, th), _ = cv2.getTextSize(anger_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(img, (fb[0], max(0, fb[1] - th - 6)), (fb[0] + tw + 8, fb[1]), COLOR_ANGER, -1)
+            cv2.putText(img, anger_lbl, (fb[0] + 4, max(th + 2, fb[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
         header_h = 40
         cv2.rectangle(img, (0, 0), (w, header_h), COLOR_BG_DARK, -1)
         cv2.putText(img, f"{self.config['name'].upper()}", (14, 27), cv2.FONT_HERSHEY_DUPLEX, 0.60, (240, 240, 240), 1, cv2.LINE_AA)
+
+        if getattr(self, 'anger_detected_active', False):
+            cv2.putText(img, "ANGRY CUSTOMER DETECTED", (w - 750, 26), cv2.FONT_HERSHEY_DUPLEX, 0.52, COLOR_ANGER, 1, cv2.LINE_AA)
 
         if getattr(self, 'phone_usage_active', False):
             cv2.putText(img, "PHONE IN USE", (w - 470, 26), cv2.FONT_HERSHEY_DUPLEX, 0.55, COLOR_PHONE, 1, cv2.LINE_AA)
@@ -1342,6 +1434,30 @@ class ModelPool:
         else:
             self.phone_model = None
             print("Notice: best_v2.pt/best.pt not found, mobile phone detection disabled.")
+
+        # Customer Anger Detector (Pluggable)
+        yunet_path = MODELS / 'face_detection_yunet_2023mar.onnx'
+        if not yunet_path.exists():
+            yunet_path = ROOT / 'models' / 'face_detection_yunet_2023mar.onnx'
+        fer_path = MODELS / 'affecnet7.script'
+        if not fer_path.exists():
+            fer_path = ROOT / 'models' / 'affecnet7.script'
+
+        if ENABLE_ANGER_DETECTION and yunet_path.exists() and fer_path.exists():
+            print(f"Loading Customer Anger Detector from {yunet_path.name} and {fer_path.name}...")
+            self.anger_detector = CustomerAngerDetector(
+                yunet_path=yunet_path,
+                fer_path=fer_path,
+                anger_threshold=ANGER_CONFIDENCE_THRESHOLD,
+                enabled=True
+            )
+            print("Customer Anger Detector loaded successfully!")
+        else:
+            self.anger_detector = None
+            if not ENABLE_ANGER_DETECTION:
+                print("Notice: Customer anger detection is disabled via configuration.")
+            else:
+                print("Notice: YuNet / AffectNet model weights not found, customer anger detection disabled.")
 
 
 # ── Server State & Manager ───────────────────────────────────────────────────
@@ -1498,6 +1614,8 @@ class CounterServer:
                     'is_24_7': getattr(w, 'is_24_7', False),
                     'phone_staff_only': getattr(w, 'phone_staff_only', True),
                     'phone_usage_active': getattr(w, 'phone_usage_active', False),
+                    'anger_detected': getattr(w, 'anger_detected_active', False),
+                    'max_anger_conf': getattr(w, 'max_anger_conf', 0.0),
                 }
 
             # Precompute KPIs per counter
