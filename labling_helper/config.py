@@ -6,8 +6,7 @@ from pathlib import Path
 # Paths to models
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_COCO_MODEL = ROOT_DIR / "backend" / "models" / "yolo11s.pt"
-_v2_model = ROOT_DIR / "backend" / "models" / "best_v2.pt"
-DEFAULT_PHONE_MODEL = _v2_model if _v2_model.exists() else (ROOT_DIR / "backend" / "models" / "best.pt")
+DEFAULT_PHONE_MODEL = ROOT_DIR / "backend" / "models" / "best.pt"
 
 # Default directories
 DEFAULT_INPUT_DIR = ROOT_DIR / "backend" / "training_samples"
@@ -46,7 +45,7 @@ COUNTER_2_ZONE = {
     "name": "Receptionist 2 (Right Desk)",
     "center_x_min": 1550,
     "y_bottom_min": 950,
-    "default_label": "using_phone",
+    "default_label": "not_using_phone",
 }
 
 # AnyLabeling JSON metadata

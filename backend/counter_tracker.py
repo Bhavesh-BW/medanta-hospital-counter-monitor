@@ -30,11 +30,22 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp')
+# Constrain OpenMP/BLAS threads to prevent CPU spikes across 32 cores
+os.environ['OMP_NUM_THREADS'] = '2'
+os.environ['MKL_NUM_THREADS'] = '2'
+os.environ['OPENBLAS_NUM_THREADS'] = '2'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '2'
+os.environ['NUMEXPR_NUM_THREADS'] = '2'
+os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp|fflags;nobuffer|max_delay;500000')
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+cv2.setNumThreads(2)
+try:
+    torch.set_num_threads(2)
+except Exception:
+    pass
 
 ROOT = pathlib.Path(__file__).resolve().parent
 MODELS = ROOT / 'models'
@@ -101,8 +112,8 @@ VIDEO_FALLBACK_FILE = 'reception1_20261102_181753_60s.mp4'
 # ── Mobile Phone & Customer Agitation Detection Configuration ─────────────────
 # Restrict phone detection to staff zone polygon (True = ignore queue/lobby/visitors)
 PHONE_DETECTION_STAFF_ZONE_ONLY = os.environ.get('PHONE_DETECTION_STAFF_ZONE_ONLY', 'True').lower() in ('true', '1', 'yes')
-# Confidence threshold for using_phone class (0.70 high threshold to eliminate false positives)
-PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.70'))
+# Confidence threshold for using_phone class (0.25 ensures robust staff phone usage detection without clipping true positives)
+PHONE_CONFIDENCE_THRESHOLD = float(os.environ.get('PHONE_CONFIDENCE_THRESHOLD', '0.25'))
 # Confidence threshold for customer anger & agitation (0.55 high threshold to prevent neutral face misclassifications)
 ANGER_THRESHOLD = float(os.environ.get('ANGER_THRESHOLD', '0.55'))
 # Emotion classes for AffectNet-7 DDAMFN model
@@ -782,6 +793,107 @@ def estimate_zone_capacity(poly_norm):
 
 
 # ── Counter Worker ───────────────────────────────────────────────────────────
+# ── RTSP Grabber (Non-Blocking Low-Latency Capture) ─────────────────────────
+class RTSPGrabber(threading.Thread):
+    """Dedicated background RTSP frame grabber to prevent buffer bloat and packet drops."""
+    def __init__(self, stream_url):
+        super().__init__(daemon=True, name=f"Grabber-{stream_url.split('/')[-1]}")
+        self.stream_url = stream_url
+        self.running = True
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.is_connected = False
+        self.last_frame_time = 0.0
+
+    def run(self):
+        while self.running:
+            cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+            if not cap.isOpened():
+                with self.lock:
+                    self.is_connected = False
+                    self.latest_frame = None
+                time.sleep(3.0)
+                continue
+
+            with self.lock:
+                self.is_connected = True
+
+            while self.running:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    with self.lock:
+                        self.is_connected = False
+                    break
+
+                # Discard corrupted / solid grey concealment frames from bad packet decode
+                if frame.std() < 12.0:
+                    continue
+
+                now = time.time()
+                with self.lock:
+                    self.latest_frame = frame
+                    self.is_connected = True
+                    self.last_frame_time = now
+
+            cap.release()
+            time.sleep(1.0)
+
+    def get_latest_frame(self):
+        with self.lock:
+            return self.latest_frame, self.is_connected
+
+    def stop(self):
+        self.running = False
+
+
+def generate_standby_frame(counter_id, counter_name, stream_url, target_w=1280, target_h=720):
+    img = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    img[:] = (20, 22, 26)  # Dark slate background
+
+    # Subtle gridlines
+    for y in range(0, target_h, 40):
+        cv2.line(img, (0, y), (target_w, y), (30, 34, 40), 1)
+    for x in range(0, target_w, 40):
+        cv2.line(img, (x, 0), (x, target_h), (30, 34, 40), 1)
+
+    # Top header bar
+    cv2.rectangle(img, (0, 0), (target_w, 38), (12, 14, 18), -1)
+    ist_time = time.strftime('%Y-%m-%d %H:%M:%S IST', time.gmtime(time.time() + 19800))
+    cv2.putText(img, f"MEDANTA HOSPITAL — {counter_name.upper()} | {ist_time}", (16, 25),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, (220, 225, 230), 1, cv2.LINE_AA)
+    cv2.putText(img, "[STANDBY RELAY]", (target_w - 180, 25),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, (250, 180, 50), 1, cv2.LINE_AA)
+
+    # Center Alert Card
+    box_w, box_h = 640, 240
+    bx1 = (target_w - box_w) // 2
+    by1 = (target_h - box_h) // 2
+    bx2 = bx1 + box_w
+    by2 = by1 + box_h
+    cv2.rectangle(img, (bx1, by1), (bx2, by2), (28, 32, 38), -1)
+    cv2.rectangle(img, (bx1, by1), (bx2, by2), (70, 75, 85), 1)
+
+    # Status Pill
+    cv2.rectangle(img, (bx1 + 25, by1 + 25), (bx1 + 340, by1 + 60), (30, 100, 230), -1)
+    cv2.putText(img, "RTSP CAMERA SIGNAL OFFLINE", (bx1 + 35, by1 + 49),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.putText(img, f"CHANNEL: {counter_name}", (bx1 + 25, by1 + 95),
+                cv2.FONT_HERSHEY_DUPLEX, 0.60, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, f"SOURCE: {stream_url}", (bx1 + 25, by1 + 125),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 170, 180), 1, cv2.LINE_AA)
+    cv2.putText(img, "STATUS: Auto-reconnecting to stream relay every 3 seconds", (bx1 + 25, by1 + 165),
+                cv2.FONT_HERSHEY_DUPLEX, 0.50, (80, 220, 100), 1, cv2.LINE_AA)
+    cv2.putText(img, "Live video will resume automatically when camera pushes frames.", (bx1 + 25, by1 + 195),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 145, 155), 1, cv2.LINE_AA)
+
+    return img
+
 class CounterWorker(threading.Thread):
     def __init__(self, config, store, model_pool):
         super().__init__(daemon=True, name=f"Worker-{config['id']}")
@@ -802,6 +914,8 @@ class CounterWorker(threading.Thread):
         self.phone_staff_only = bool(config.get('phone_staff_only', PHONE_DETECTION_STAFF_ZONE_ONLY))
 
         self.latest_jpeg = None
+        self.latest_frame_time = 0.0
+        self.grabber = None
         self.latest_snapshot = None
         self.fps = 0.0
         self.scan_ms = 0.0
@@ -886,6 +1000,8 @@ class CounterWorker(threading.Thread):
 
     def stop(self):
         self.running = False
+        if self.grabber is not None:
+            self.grabber.stop()
 
     def run(self):
         stream_url = self.config['stream']
@@ -906,450 +1022,471 @@ class CounterWorker(threading.Thread):
         current_source = playlist[playlist_idx] if playlist else stream_url
         is_file = (playlist and len(playlist) > 0 and os.path.isfile(playlist[0])) or os.path.isfile(current_source)
 
+        if not is_file:
+            # Live RTSP: launch dedicated non-blocking grabber
+            self.grabber = RTSPGrabber(stream_url)
+            self.grabber.start()
+
+        cap = None
+        video_fps = 25.0
+        frame_times = collections.deque(maxlen=30)
+
         while self.running:
-            current_source = playlist[playlist_idx] if (playlist and playlist_idx < len(playlist)) else stream_url
-            cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG)
-            if not cap.isOpened():
-                with self.lock:
-                    self.error = f"Stream offline ({self.config['stream']}), standby mode"
-                    if self.latest_jpeg is None:
-                        fallback_path = ROOT / f"test_snap_{self.config['id']}.jpg"
-                        if not fallback_path.exists():
-                            fallback_path = ROOT / 'test_snap_recep1.jpg'
-                        if fallback_path.exists():
-                            fb_img = cv2.imread(str(fallback_path))
-                            if fb_img is not None:
-                                hud_fb = fb_img.copy()
-                                in_mon, _ = self.is_in_monitoring_hours()
-                                self._render_hud(hud_fb, self.staff_zone, self.queue_zone, [], False, 0, 0, 0.0, 'idle', 0, self.capacity_threshold, self.service_time_mins, in_mon)
-                                _, fb_enc = cv2.imencode('.jpg', hud_fb, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                                self.latest_jpeg = fb_enc.tobytes()
-                                _, fb_raw = cv2.imencode('.jpg', fb_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                                self.latest_snapshot = fb_raw.tobytes()
-                time.sleep(3.0 if is_file else 10.0)
-                continue
+            t0 = time.time()
+            frame = None
+
+            if is_file:
+                if cap is None or not cap.isOpened():
+                    current_source = playlist[playlist_idx] if (playlist and playlist_idx < len(playlist)) else stream_url
+                    cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG)
+                    video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+
+                ret, frame = cap.read() if cap else (False, None)
+                if not ret or frame is None:
+                    if playlist and len(playlist) > 0:
+                        playlist_idx = (playlist_idx + 1) % len(playlist)
+                        current_source = playlist[playlist_idx]
+                        if cap:
+                            cap.release()
+                        cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG)
+                        video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                        # Skip initial flat grey keyframe priming frames
+                        for _ in range(4):
+                            ret, frame = cap.read()
+                            if ret and frame is not None and frame.std() >= 15.0:
+                                break
+                        if not ret or frame is None:
+                            time.sleep(0.05)
+                            continue
+                    else:
+                        time.sleep(0.1)
+                        continue
+            else:
+                # Live RTSP non-blocking grabber
+                frame, connected = self.grabber.get_latest_frame()
+                if not connected or frame is None:
+                    with self.lock:
+                        self.error = f"Stream offline ({self.config['stream']}), standby mode"
+                        standby = generate_standby_frame(self.config['id'], self.config['name'], stream_url)
+                        _, fb_enc = cv2.imencode('.jpg', standby, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        self.latest_jpeg = fb_enc.tobytes()
+                        self.latest_frame_time = time.time()
+                        self.fps = 0.0
+                    time.sleep(0.2)
+                    continue
 
             with self.lock:
                 self.error = None
 
-            video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            frame_delay = 1.0 / max(10.0, min(30.0, video_fps)) if is_file else 0.0
-            frame_times = collections.deque(maxlen=30)
+            h, w = frame.shape[:2]
+            now = time.time()
 
-            while self.running:
-                t0 = time.time()
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    if is_file and playlist:
-                        playlist_idx = (playlist_idx + 1) % len(playlist)
-                        current_source = playlist[playlist_idx]
-                        cap.release()
-                        cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG)
-                        time.sleep(0.02)
-                        continue
-                    with self.lock:
-                        self.error = "Stream disconnected, retrying..."
-                    break
+            with self.lock:
+                if self.latest_snapshot is None or (now % 3.0 < 0.15):
+                    _, snap_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    self.latest_snapshot = snap_buf.tobytes()
+                staff_poly = self.staff_zone
+                queue_poly = self.queue_zone
+                cap_thresh = self.capacity_threshold
+                unattend_sec = self.unattended_seconds
+                serv_mins = self.service_time_mins
+                phone_staff_only = getattr(self, 'phone_staff_only', PHONE_DETECTION_STAFF_ZONE_ONLY)
 
-                h, w = frame.shape[:2]
-                now = time.time()
+            self.frame_idx += 1
+            persons_in_staff = 0
+            persons_in_queue = []
 
-                with self.lock:
-                    if self.latest_snapshot is None or (now % 3.0 < 0.15):
-                        _, snap_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        self.latest_snapshot = snap_buf.tobytes()
-                    staff_poly = self.staff_zone
-                    queue_poly = self.queue_zone
-                    cap_thresh = self.capacity_threshold
-                    unattend_sec = self.unattended_seconds
-                    serv_mins = self.service_time_mins
-                    phone_staff_only = getattr(self, 'phone_staff_only', PHONE_DETECTION_STAFF_ZONE_ONLY)
+            with self.model_pool.lock:
+                results = self.model_pool.model.predict(
+                    frame,
+                    classes=[0],
+                    conf=0.35,
+                    verbose=False,
+                    device=DEVICE,
+                    imgsz=640
+                )
 
-                self.frame_idx += 1
-                persons_in_staff = 0
-                persons_in_queue = []
-
-                with self.model_pool.lock:
-                    results = self.model_pool.model.predict(
+                # Mobile Phone Detection (runs on a strict 4-frame cadence at imgsz=640)
+                if self.model_pool.phone_model is not None and (self.frame_idx % 4 == 0):
+                    phone_res = self.model_pool.phone_model.predict(
                         frame,
                         classes=[0],
-                        conf=0.35,
+                        conf=PHONE_CONFIDENCE_THRESHOLD,
                         verbose=False,
                         device=DEVICE,
                         imgsz=640
                     )
+                    fresh_phone_dets = []
+                    for pr in phone_res:
+                        if pr.boxes is not None and len(pr.boxes) > 0:
+                            p_boxes = np.nan_to_num(pr.boxes.xyxy.cpu().numpy(), nan=0.0).astype(int)
+                            p_confs = pr.boxes.conf.cpu().numpy()
+                            for pb, pc in zip(p_boxes, p_confs):
+                                p_cx = (pb[0] + pb[2]) / 2.0
+                                p_cy = (pb[1] + pb[3]) / 2.0
+                                p_foot_y = float(pb[3]) - 2.0
+                                p_torso_y = pb[1] + 0.35 * (pb[3] - pb[1])
+                                norm_pt_center = (p_cx / w, p_cy / h)
+                                norm_pt_foot = (p_cx / w, p_foot_y / h)
+                                norm_pt_torso = (p_cx / w, p_torso_y / h)
 
-                    # Mobile Phone Detection (runs periodically every 3 frames to maintain high video FPS)
-                    if self.model_pool.phone_model is not None and (self.frame_idx % 3 == 0 or len(self.active_phone_detections) == 0):
-                        phone_res = self.model_pool.phone_model.predict(
-                            frame,
-                            classes=[0],  # 0: 'using_phone'
-                            conf=PHONE_CONFIDENCE_THRESHOLD,  # Configurable threshold (default 0.35)
-                            verbose=False,
-                            device=DEVICE,
-                            imgsz=1280
-                        )
-                        fresh_phone_dets = []
-                        for pr in phone_res:
-                            if pr.boxes is not None and len(pr.boxes) > 0:
-                                p_boxes = pr.boxes.xyxy.cpu().numpy().astype(int)
-                                p_confs = pr.boxes.conf.cpu().numpy()
-                                for pb, pc in zip(p_boxes, p_confs):
-                                    # Multi-point zone check relative to staff zone
-                                    p_cx = (pb[0] + pb[2]) / 2.0
-                                    p_cy = (pb[1] + pb[3]) / 2.0
-                                    p_foot_y = float(pb[3]) - 2.0
-                                    p_torso_y = pb[1] + 0.35 * (pb[3] - pb[1])
-                                    norm_pt_center = (p_cx / w, p_cy / h)
-                                    norm_pt_foot = (p_cx / w, p_foot_y / h)
-                                    norm_pt_torso = (p_cx / w, p_torso_y / h)
+                                in_staff_zone = (
+                                    _point_in_norm_poly(norm_pt_center, staff_poly) or
+                                    _point_in_norm_poly(norm_pt_foot, staff_poly) or
+                                    _point_in_norm_poly(norm_pt_torso, staff_poly)
+                                )
 
-                                    in_staff_zone = (
-                                        _point_in_norm_poly(norm_pt_center, staff_poly) or
-                                        _point_in_norm_poly(norm_pt_foot, staff_poly) or
-                                        _point_in_norm_poly(norm_pt_torso, staff_poly)
-                                    )
+                                if phone_staff_only and not in_staff_zone:
+                                    continue
 
-                                    # If configured to restrict detection to staff zone, skip detections outside
-                                    if phone_staff_only and not in_staff_zone:
+                                overlaps_person = len(self.tracks) == 0 or any(
+                                    _boxes_overlap(pb, tr.bbox)
+                                    for tr in self.tracks if tr.misses == 0
+                                )
+                                if overlaps_person:
+                                    fresh_phone_dets.append((pb, float(pc), now))
+                    self.active_phone_detections = fresh_phone_dets
+                else:
+                    self.active_phone_detections = [pd for pd in self.active_phone_detections if (now - pd[2]) < 1.5]
+
+            scan_elapsed = (time.time() - t0) * 1000
+
+            detections = []
+            for r in results:
+                if r.boxes is not None and len(r.boxes) > 0:
+                    xyxy = np.nan_to_num(r.boxes.xyxy.cpu().numpy(), nan=0.0).astype(int)
+                    confs = r.boxes.conf.cpu().numpy()
+                    for box, conf in zip(xyxy, confs):
+                        detections.append((box, float(conf)))
+
+            matched_tracks = set()
+            matched_dets = set()
+
+            for ti, tr in enumerate(self.tracks):
+                best_iou = 0.0
+                best_di = -1
+                for di, (box, conf) in enumerate(detections):
+                    if di in matched_dets:
+                        continue
+                    iou = _iou(tr.bbox, box)
+                    if iou > 0.25 and iou > best_iou:
+                        best_iou = iou
+                        best_di = di
+                if best_di >= 0:
+                    tr.update(detections[best_di][0], detections[best_di][1], now)
+                    matched_tracks.add(ti)
+                    matched_dets.add(best_di)
+                else:
+                    tr.misses += 1
+
+            for di, (box, conf) in enumerate(detections):
+                if di not in matched_dets:
+                    new_tr = Track(self.next_track_id, box, conf, now)
+                    self.next_track_id += 1
+                    self.tracks.append(new_tr)
+
+            self.tracks = [t for t in self.tracks if not t.is_dead(now, max_age_seconds=3.5)]
+
+            for tr in self.tracks:
+                foot_x = (tr.bbox[0] + tr.bbox[2]) / 2.0
+                foot_y = float(tr.bbox[3]) - 2.0
+                pt_foot = (foot_x / w, foot_y / h)
+                center_y = (tr.bbox[1] + tr.bbox[3]) / 2.0
+                torso_y = tr.bbox[1] + 0.35 * (tr.bbox[3] - tr.bbox[1])
+                pt_center = (foot_x / w, center_y / h)
+                pt_torso = (foot_x / w, torso_y / h)
+
+                in_staff = (
+                    _point_in_norm_poly(pt_foot, staff_poly) or
+                    _point_in_norm_poly(pt_center, staff_poly) or
+                    _point_in_norm_poly(pt_torso, staff_poly)
+                )
+                in_queue = _point_in_norm_poly(pt_foot, queue_poly)
+
+                if in_staff:
+                    tr.role = 'staff'
+                    persons_in_staff += 1
+                    tr.entry_queue_time = None
+                elif in_queue:
+                    if tr.entry_queue_time is None:
+                        tr.entry_queue_time = now
+                    tr.dwell_seconds = max(0.0, now - tr.entry_queue_time)
+
+                    if tr.dwell_seconds >= 1.2:
+                        tr.role = 'queue'
+                        persons_in_queue.append(tr)
+                    else:
+                        tr.role = 'entering_queue'
+                else:
+                    tr.role = 'other'
+                    tr.entry_queue_time = None
+                    tr.dwell_seconds = 0.0
+
+            staff_present = (persons_in_staff > 0)
+            queue_count = len(persons_in_queue)
+            dwell_times = [t.dwell_seconds for t in persons_in_queue]
+            avg_dwell = np.mean(dwell_times) if dwell_times else 0.0
+            max_dwell = max(dwell_times) if dwell_times else 0.0
+
+            in_monitoring, sched_label = self.is_in_monitoring_hours()
+            status = 'normal'
+            unattend_duration = 0
+
+            if not in_monitoring:
+                status = 'closed'
+                self.unattended_start_time = None
+                unattend_duration = 0
+            elif queue_count > 0:
+                if staff_present:
+                    self.unattended_start_time = None
+                    if queue_count > cap_thresh:
+                        status = 'high_queue'
+                    else:
+                        status = 'normal'
+                else:
+                    if self.unattended_start_time is None:
+                        self.unattended_start_time = now
+                    unattend_duration = int(now - self.unattended_start_time)
+
+                    if unattend_duration >= unattend_sec:
+                        status = 'unattended'
+                    else:
+                        status = 'staff_away'
+            else:
+                self.unattended_start_time = None
+                status = 'idle' if staff_present else 'idle_unstaffed'
+
+            # ── Mobile Phone Detection: Staff Desk Monitoring Only ──
+            staff_using_phone = False
+            max_phone_conf = 0.0
+
+            for pb, pc, _ in getattr(self, 'active_phone_detections', []):
+                p_cx = (pb[0] + pb[2]) / 2.0
+                p_cy = (pb[1] + pb[3]) / 2.0
+                p_foot_y = float(pb[3]) - 2.0
+                p_torso_y = pb[1] + 0.35 * (pb[3] - pb[1])
+                norm_pt_center = (p_cx / w, p_cy / h)
+                norm_pt_foot = (p_cx / w, p_foot_y / h)
+                norm_pt_torso = (p_cx / w, p_torso_y / h)
+
+                in_staff = (
+                    _point_in_norm_poly(norm_pt_center, staff_poly) or
+                    _point_in_norm_poly(norm_pt_foot, staff_poly) or
+                    _point_in_norm_poly(norm_pt_torso, staff_poly)
+                )
+
+                matched_track_role = None
+                for tr in self.tracks:
+                    if tr.misses == 0 and _boxes_overlap(tr.bbox, pb):
+                        matched_track_role = tr.role
+                        break
+
+                if in_staff or matched_track_role == 'staff':
+                    staff_using_phone = True
+                    max_phone_conf = max(max_phone_conf, pc)
+
+            self.phone_usage_active = staff_using_phone
+
+            # ── Customer Agitation & Anger Emotion Detection (Cadenced every 6 frames) ──
+            fresh_anger_dets = []
+            if getattr(self.model_pool, 'face_detector', None) is not None and getattr(self.model_pool, 'fer_model', None) is not None:
+                if self.frame_idx % 6 == 0:
+                    target_tracks = [t for t in self.tracks if t.misses == 0 and t.role in ('queue', 'entering_queue')]
+                    for tr in target_tracks:
+                        tx1, ty1, tx2, ty2 = tr.bbox
+                        px1 = max(0, tx1)
+                        py1 = max(0, ty1)
+                        px2 = min(w, tx2)
+                        py2 = min(h, ty2)
+                        pw = px2 - px1
+                        ph = py2 - py1
+                        if pw < 30 or ph < 30:
+                            continue
+
+                        person_crop = frame[py1:py2, px1:px2]
+                        try:
+                            self.model_pool.face_detector.setInputSize((pw, ph))
+                            _, faces = self.model_pool.face_detector.detect(person_crop)
+                            if faces is not None and len(faces) > 0:
+                                for face in faces:
+                                    f_conf = float(face[-1])
+                                    if f_conf < 0.50:
+                                        continue
+                                    fx, fy, fw, fh = face[0:4].astype(int)
+                                    gx1 = max(0, px1 + fx)
+                                    gy1 = max(0, py1 + fy)
+                                    gx2 = min(w, px1 + fx + fw)
+                                    gy2 = min(h, py1 + fy + fh)
+                                    if (gx2 - gx1) < 20 or (gy2 - gy1) < 20:
                                         continue
 
-                                    # Overlap with tracked person
-                                    overlaps_person = len(self.tracks) == 0 or any(
-                                        _boxes_overlap(pb, tr.bbox)
-                                        for tr in self.tracks if tr.misses == 0
-                                    )
-                                    if overlaps_person:
-                                        fresh_phone_dets.append((pb, float(pc), now))
-                        self.active_phone_detections = fresh_phone_dets
-                    else:
-                        # Decay old phone detections after 1.5 seconds so boxes don't linger
-                        self.active_phone_detections = [pd for pd in self.active_phone_detections if (now - pd[2]) < 1.5]
+                                    face_crop = frame[gy1:gy2, gx1:gx2]
+                                    f_resized = cv2.resize(face_crop, (112, 112))
+                                    f_rgb = cv2.cvtColor(f_resized, cv2.COLOR_BGR2RGB)
+                                    f_tensor = torch.from_numpy(f_rgb).permute(2, 0, 1).float() / 255.0
+                                    f_tensor = ((f_tensor - 0.5) / 0.5).unsqueeze(0)
+                                    with torch.no_grad():
+                                        f_logits = self.model_pool.fer_model(f_tensor)
+                                        if isinstance(f_logits, tuple):
+                                            f_logits = f_logits[0]
+                                        f_probs = torch.softmax(f_logits, dim=1).squeeze(0).cpu().numpy()
+                                    anger_score = float(f_probs[6])
+                                    dom_idx = int(np.argmax(f_probs))
+                                    dom_label = EMOTION_LABELS[dom_idx]
+                                    dom_conf = float(f_probs[dom_idx])
 
-                scan_elapsed = (time.time() - t0) * 1000
-
-                detections = []
-                for r in results:
-                    if r.boxes is not None and len(r.boxes) > 0:
-                        xyxy = r.boxes.xyxy.cpu().numpy().astype(int)
-                        confs = r.boxes.conf.cpu().numpy()
-                        for box, conf in zip(xyxy, confs):
-                            detections.append((box, float(conf)))
-
-                matched_tracks = set()
-                matched_dets = set()
-
-                for ti, tr in enumerate(self.tracks):
-                    best_iou = 0.0
-                    best_di = -1
-                    for di, (box, conf) in enumerate(detections):
-                        if di in matched_dets:
-                            continue
-                        iou = _iou(tr.bbox, box)
-                        if iou > 0.25 and iou > best_iou:
-                            best_iou = iou
-                            best_di = di
-                    if best_di >= 0:
-                        tr.update(detections[best_di][0], detections[best_di][1], now)
-                        matched_tracks.add(ti)
-                        matched_dets.add(best_di)
-                    else:
-                        tr.misses += 1
-
-                for di, (box, conf) in enumerate(detections):
-                    if di not in matched_dets:
-                        new_tr = Track(self.next_track_id, box, conf, now)
-                        self.next_track_id += 1
-                        self.tracks.append(new_tr)
-
-                self.tracks = [t for t in self.tracks if not t.is_dead(now, max_age_seconds=3.5)]
-
-                for tr in self.tracks:
-                    foot_x = (tr.bbox[0] + tr.bbox[2]) / 2.0
-                    foot_y = float(tr.bbox[3]) - 2.0
-                    pt_foot = (foot_x / w, foot_y / h)
-                    center_y = (tr.bbox[1] + tr.bbox[3]) / 2.0
-                    torso_y = tr.bbox[1] + 0.35 * (tr.bbox[3] - tr.bbox[1])
-                    pt_center = (foot_x / w, center_y / h)
-                    pt_torso = (foot_x / w, torso_y / h)
-
-                    in_staff = (
-                        _point_in_norm_poly(pt_foot, staff_poly) or
-                        _point_in_norm_poly(pt_center, staff_poly) or
-                        _point_in_norm_poly(pt_torso, staff_poly)
-                    )
-                    in_queue = _point_in_norm_poly(pt_foot, queue_poly)
-
-                    if in_staff:
-                        tr.role = 'staff'
-                        persons_in_staff += 1
-                        tr.entry_queue_time = None
-                    elif in_queue:
-                        if tr.entry_queue_time is None:
-                            tr.entry_queue_time = now
-                        tr.dwell_seconds = max(0.0, now - tr.entry_queue_time)
-
-                        # Dwell time filter: requires 1.2 seconds standing before being counted as a waiting patient!
-                        # Fleeting passersby walking past in the background are filtered out.
-                        if tr.dwell_seconds >= 1.2:
-                            tr.role = 'queue'
-                            persons_in_queue.append(tr)
-                        else:
-                            tr.role = 'entering_queue'
-                    else:
-                        tr.role = 'other'
-                        tr.entry_queue_time = None
-                        tr.dwell_seconds = 0.0
-
-                staff_present = (persons_in_staff > 0)
-                queue_count = len(persons_in_queue)
-                dwell_times = [t.dwell_seconds for t in persons_in_queue]
-                avg_dwell = np.mean(dwell_times) if dwell_times else 0.0
-                max_dwell = max(dwell_times) if dwell_times else 0.0
-
-                in_monitoring, sched_label = self.is_in_monitoring_hours()
-                status = 'normal'
-                unattend_duration = 0
-
-                if not in_monitoring:
-                    status = 'closed'
-                    self.unattended_start_time = None
-                    unattend_duration = 0
-                elif queue_count > 0:
-                    if staff_present:
-                        self.unattended_start_time = None
-                        if queue_count > cap_thresh:
-                            status = 'high_queue'
-                        else:
-                            status = 'normal'
-                    else:
-                        if self.unattended_start_time is None:
-                            self.unattended_start_time = now
-                        unattend_duration = int(now - self.unattended_start_time)
-
-                        if unattend_duration >= unattend_sec:
-                            status = 'unattended'
-                        else:
-                            status = 'staff_away'
+                                    if anger_score >= ANGER_THRESHOLD or (dom_label == 'anger' and dom_conf >= ANGER_THRESHOLD):
+                                        fresh_anger_dets.append(([gx1, gy1, gx2, gy2], anger_score, now, tr.track_id))
+                        except Exception:
+                            pass
+                    self.active_anger_detections = fresh_anger_dets
                 else:
-                    self.unattended_start_time = None
-                    status = 'idle' if staff_present else 'idle_unstaffed'
+                    self.active_anger_detections = [ad for ad in self.active_anger_detections if (now - ad[2]) < 1.5]
+            else:
+                self.active_anger_detections = []
 
-                # ── Mobile Phone Detection: Staff Desk Monitoring Only ──
-                staff_using_phone = False
-                max_phone_conf = 0.0
+            self.anger_active = len(self.active_anger_detections) > 0
 
-                for pb, pc, _ in getattr(self, 'active_phone_detections', []):
-                    p_cx = (pb[0] + pb[2]) / 2.0
-                    p_cy = (pb[1] + pb[3]) / 2.0
-                    p_foot_y = float(pb[3]) - 2.0
-                    p_torso_y = pb[1] + 0.35 * (pb[3] - pb[1])
-                    norm_pt_center = (p_cx / w, p_cy / h)
-                    norm_pt_foot = (p_cx / w, p_foot_y / h)
-                    norm_pt_torso = (p_cx / w, p_torso_y / h)
-
-                    in_staff = (
-                        _point_in_norm_poly(norm_pt_center, staff_poly) or
-                        _point_in_norm_poly(norm_pt_foot, staff_poly) or
-                        _point_in_norm_poly(norm_pt_torso, staff_poly)
-                    )
-
-                    matched_track_role = None
-                    for tr in self.tracks:
-                        if tr.misses == 0 and _boxes_overlap(tr.bbox, pb):
-                            matched_track_role = tr.role
-                            break
-
-                    # Strictly detect phone usage by staff on duty (ignore customer queue phone usage)
-                    if in_staff or matched_track_role == 'staff':
-                        staff_using_phone = True
-                        max_phone_conf = max(max_phone_conf, pc)
-
-                self.phone_usage_active = staff_using_phone
-
-                # ── Customer Agitation & Anger Emotion Detection (AffecNet-7 + YuNet) ──
-                fresh_anger_dets = []
-                if getattr(self.model_pool, 'face_detector', None) is not None and getattr(self.model_pool, 'fer_model', None) is not None:
-                    if (self.frame_idx % 3 == 0) or len(self.active_anger_detections) == 0:
-                        # Scan candidate persons waiting at counter or in queue
-                        target_tracks = [t for t in self.tracks if t.misses == 0 and t.role in ('queue', 'entering_queue', 'other')]
-                        for tr in target_tracks:
-                            tx1, ty1, tx2, ty2 = tr.bbox
-                            px1 = max(0, tx1)
-                            py1 = max(0, ty1)
-                            px2 = min(w, tx2)
-                            py2 = min(h, ty2)
-                            pw = px2 - px1
-                            ph = py2 - py1
-                            if pw < 30 or ph < 30:
-                                continue
-
-                            person_crop = frame[py1:py2, px1:px2]
-                            try:
-                                self.model_pool.face_detector.setInputSize((pw, ph))
-                                _, faces = self.model_pool.face_detector.detect(person_crop)
-                                if faces is not None and len(faces) > 0:
-                                    for face in faces:
-                                        f_conf = float(face[-1])
-                                        if f_conf < 0.50:
-                                            continue
-                                        fx, fy, fw, fh = face[0:4].astype(int)
-                                        gx1 = max(0, px1 + fx)
-                                        gy1 = max(0, py1 + fy)
-                                        gx2 = min(w, px1 + fx + fw)
-                                        gy2 = min(h, py1 + fy + fh)
-                                        if (gx2 - gx1) < 20 or (gy2 - gy1) < 20:
-                                            continue
-
-                                        face_crop = frame[gy1:gy2, gx1:gx2]
-                                        f_resized = cv2.resize(face_crop, (112, 112))
-                                        f_rgb = cv2.cvtColor(f_resized, cv2.COLOR_BGR2RGB)
-                                        f_tensor = torch.from_numpy(f_rgb).permute(2, 0, 1).float() / 255.0
-                                        f_tensor = ((f_tensor - 0.5) / 0.5).unsqueeze(0)
-                                        with torch.no_grad():
-                                            f_logits = self.model_pool.fer_model(f_tensor)
-                                            if isinstance(f_logits, tuple):
-                                                f_logits = f_logits[0]
-                                            f_probs = torch.softmax(f_logits, dim=1).squeeze(0).cpu().numpy()
-                                        anger_score = float(f_probs[6])  # 6 = anger
-                                        dom_idx = int(np.argmax(f_probs))
-                                        dom_label = EMOTION_LABELS[dom_idx]
-                                        dom_conf = float(f_probs[dom_idx])
-
-                                        # Strict threshold (>= 0.55 / above 50% to prevent false positives)
-                                        if anger_score >= ANGER_THRESHOLD or (dom_label == 'anger' and dom_conf >= ANGER_THRESHOLD):
-                                            fresh_anger_dets.append(([gx1, gy1, gx2, gy2], anger_score, now, tr.track_id))
-                            except Exception:
-                                pass
-                        self.active_anger_detections = fresh_anger_dets
-                    else:
-                        self.active_anger_detections = [ad for ad in self.active_anger_detections if (now - ad[2]) < 1.5]
-                else:
-                    self.active_anger_detections = []
-
-                self.anger_active = len(self.active_anger_detections) > 0
-
+            # ── 720p Resolution Downscaling Optimization (Saves 93% Bandwidth) ──
+            target_w, target_h = 1280, 720
+            if w > 1280:
+                hud_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                scale_x = target_w / float(w)
+                scale_y = target_h / float(h)
+            else:
                 hud_frame = frame.copy()
-                self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present, persons_in_staff, queue_count, avg_dwell, status, unattend_duration, cap_thresh, serv_mins, in_monitoring, is_file)
+                scale_x = 1.0
+                scale_y = 1.0
 
-                _, enc = cv2.imencode('.jpg', hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                jpeg_bytes = enc.tobytes()
+            self._render_hud(hud_frame, staff_poly, queue_poly, self.tracks, staff_present,
+                             persons_in_staff, queue_count, avg_dwell, status, unattend_duration,
+                             cap_thresh, serv_mins, in_monitoring, is_file, scale_x=scale_x, scale_y=scale_y)
 
-                # Trigger incident alert events with annotated snapshot evidence
-                if in_monitoring and queue_count > 0:
-                    if staff_present and queue_count > cap_thresh:
-                        if now - self.last_queue_alert_sent > 60:
-                            self.last_queue_alert_sent = now
-                            self.store.log_event({
-                                'counter_id': self.config['id'],
-                                'counter_name': self.config['name'],
-                                'event_type': 'high_queue',
-                                'severity': 'medium',
-                                'queue_length': queue_count,
-                                'avg_wait_seconds': avg_dwell,
-                                'staff_present': True,
-                                'unattended_seconds': 0,
-                                'details': f"Queue length ({queue_count}) exceeded capacity threshold ({cap_thresh})",
-                                'photo': jpeg_bytes
-                            })
-                    elif not staff_present and unattend_duration >= unattend_sec:
-                        if now - self.last_unattended_alert_sent > 90:
-                            self.last_unattended_alert_sent = now
-                            self.store.log_event({
-                                'counter_id': self.config['id'],
-                                'counter_name': self.config['name'],
-                                'event_type': 'unattended_alert',
-                                'severity': 'high',
-                                'queue_length': queue_count,
-                                'avg_wait_seconds': avg_dwell,
-                                'staff_present': False,
-                                'unattended_seconds': unattend_duration,
-                                'details': f"Counter unattended for {unattend_duration}s with {queue_count} patient(s) waiting",
-                                'photo': jpeg_bytes
-                            })
+            _, enc = cv2.imencode('.jpg', hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            jpeg_bytes = enc.tobytes()
 
-                if staff_using_phone and (now - self.last_phone_alert_sent > 30):
-                    self.last_phone_alert_sent = now
-                    crop_photo = None
-                    for pb, pc, _ in getattr(self, 'active_phone_detections', []):
-                        pad = 30
-                        px1 = max(0, int(pb[0] - pad))
-                        py1 = max(0, int(pb[1] - pad))
-                        px2 = min(w, int(pb[2] + pad))
-                        py2 = min(h, int(pb[3] + pad))
-                        if px2 > px1 and py2 > py1:
-                            ok_c, enc_c = cv2.imencode('.jpg', frame[py1:py2, px1:px2], [cv2.IMWRITE_JPEG_QUALITY, 85])
-                            if ok_c:
-                                crop_photo = enc_c.tobytes()
-                            break
+            # Trigger incident alert events with annotated snapshot evidence
+            if in_monitoring and queue_count > 0:
+                if staff_present and queue_count > cap_thresh:
+                    if now - self.last_queue_alert_sent > 60:
+                        self.last_queue_alert_sent = now
+                        self.store.log_event({
+                            'counter_id': self.config['id'],
+                            'counter_name': self.config['name'],
+                            'event_type': 'high_queue',
+                            'severity': 'medium',
+                            'queue_length': queue_count,
+                            'avg_wait_seconds': avg_dwell,
+                            'staff_present': True,
+                            'unattended_seconds': 0,
+                            'details': f"Queue length ({queue_count}) exceeded capacity threshold ({cap_thresh})",
+                            'photo': jpeg_bytes
+                        })
+                elif not staff_present and unattend_duration >= unattend_sec:
+                    if now - self.last_unattended_alert_sent > 90:
+                        self.last_unattended_alert_sent = now
+                        self.store.log_event({
+                            'counter_id': self.config['id'],
+                            'counter_name': self.config['name'],
+                            'event_type': 'unattended_alert',
+                            'severity': 'high',
+                            'queue_length': queue_count,
+                            'avg_wait_seconds': avg_dwell,
+                            'staff_present': False,
+                            'unattended_seconds': unattend_duration,
+                            'details': f"Counter unattended for {unattend_duration}s with {queue_count} patient(s) waiting",
+                            'photo': jpeg_bytes
+                        })
 
-                    self.store.log_event({
-                        'counter_id': self.config['id'],
-                        'counter_name': self.config['name'],
-                        'event_type': 'phone_usage_staff',
-                        'severity': 'high',
-                        'queue_length': queue_count,
-                        'avg_wait_seconds': avg_dwell,
-                        'staff_present': staff_present,
-                        'unattended_seconds': unattend_duration,
-                        'details': f"Staff member on duty detected using mobile phone at desk (Confidence: {max_phone_conf*100:.0f}%)",
-                        'photo': jpeg_bytes,
-                        'crop_photo': crop_photo
-                    })
+            if staff_using_phone and (now - self.last_phone_alert_sent > 30):
+                self.last_phone_alert_sent = now
+                crop_photo = None
+                for pb, pc, _ in getattr(self, 'active_phone_detections', []):
+                    pad = 20
+                    px1 = max(0, int(pb[0] - pad))
+                    py1 = max(0, int(pb[1] - pad))
+                    px2 = min(w, int(pb[2] + pad))
+                    py2 = min(h, int(pb[3] + pad))
+                    if px2 > px1 and py2 > py1:
+                        ok_c, enc_c = cv2.imencode('.jpg', frame[py1:py2, px1:px2], [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        if ok_c:
+                            crop_photo = enc_c.tobytes()
+                        break
 
-                # Trigger customer agitation / anger alert event
-                if self.anger_active and (now - self.last_anger_alert_sent > 45):
-                    self.last_anger_alert_sent = now
-                    crop_photo = None
-                    max_anger_conf = max([ad[1] for ad in self.active_anger_detections]) if self.active_anger_detections else ANGER_THRESHOLD
-                    for ab, ac, _, _ in getattr(self, 'active_anger_detections', []):
-                        pad = 30
-                        ax1 = max(0, int(ab[0] - pad))
-                        ay1 = max(0, int(ab[1] - pad))
-                        ax2 = min(w, int(ab[2] + pad))
-                        ay2 = min(h, int(ab[3] + pad))
-                        if ax2 > ax1 and ay2 > ay1:
-                            ok_c, enc_c = cv2.imencode('.jpg', frame[ay1:ay2, ax1:ax2], [cv2.IMWRITE_JPEG_QUALITY, 90])
-                            if ok_c:
-                                crop_photo = enc_c.tobytes()
-                            break
+                self.store.log_event({
+                    'counter_id': self.config['id'],
+                    'counter_name': self.config['name'],
+                    'event_type': 'phone_usage_staff',
+                    'severity': 'medium',
+                    'queue_length': queue_count,
+                    'avg_wait_seconds': avg_dwell,
+                    'staff_present': staff_present,
+                    'unattended_seconds': unattend_duration,
+                    'details': f"Staff member on active duty observed using mobile phone (Confidence: {max_phone_conf*100:.0f}%)",
+                    'photo': jpeg_bytes,
+                    'crop_photo': crop_photo
+                })
 
-                    self.store.log_event({
-                        'counter_id': self.config['id'],
-                        'counter_name': self.config['name'],
-                        'event_type': 'anger_detected',
-                        'severity': 'high',
-                        'queue_length': queue_count,
-                        'avg_wait_seconds': avg_dwell,
-                        'staff_present': staff_present,
-                        'unattended_seconds': unattend_duration,
-                        'details': f"Customer agitation / angry facial expression detected at counter (Confidence: {max_anger_conf*100:.0f}%)",
-                        'photo': jpeg_bytes,
-                        'crop_photo': crop_photo
-                    })
+            if self.anger_active and (now - self.last_anger_alert_sent > 30):
+                self.last_anger_alert_sent = now
+                crop_photo = None
+                max_anger_conf = max([ad[1] for ad in self.active_anger_detections]) if self.active_anger_detections else ANGER_THRESHOLD
+                for ab, ac, _, _ in getattr(self, 'active_anger_detections', []):
+                    pad = 30
+                    ax1 = max(0, int(ab[0] - pad))
+                    ay1 = max(0, int(ab[1] - pad))
+                    ax2 = min(w, int(ab[2] + pad))
+                    ay2 = min(h, int(ab[3] + pad))
+                    if ax2 > ax1 and ay2 > ay1:
+                        ok_c, enc_c = cv2.imencode('.jpg', frame[ay1:ay2, ax1:ax2], [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        if ok_c:
+                            crop_photo = enc_c.tobytes()
+                        break
 
-                frame_times.append(time.time() - t0)
-                fps = round(1.0 / (sum(frame_times) / len(frame_times)), 1) if frame_times else 0.0
+                self.store.log_event({
+                    'counter_id': self.config['id'],
+                    'counter_name': self.config['name'],
+                    'event_type': 'anger_detected',
+                    'severity': 'high',
+                    'queue_length': queue_count,
+                    'avg_wait_seconds': avg_dwell,
+                    'staff_present': staff_present,
+                    'unattended_seconds': unattend_duration,
+                    'details': f"Customer agitation / angry facial expression detected at counter (Confidence: {max_anger_conf*100:.0f}%)",
+                    'photo': jpeg_bytes,
+                    'crop_photo': crop_photo
+                })
 
-                with self.lock:
-                    self.latest_jpeg = jpeg_bytes
-                    self.fps = fps
-                    self.scan_ms = round(scan_elapsed, 1)
-                    self.staff_present = staff_present
-                    self.staff_count = persons_in_staff
-                    self.queue_length = queue_count
-                    self.avg_wait_seconds = round(avg_dwell, 1)
-                    self.max_wait_seconds = round(max_dwell, 1)
-                    self.status = status
-                    self.current_unattended_seconds = unattend_duration
+            frame_times.append(time.time() - t0)
+            fps = round(1.0 / (sum(frame_times) / len(frame_times)), 1) if frame_times else 0.0
 
-                if is_file and frame_delay > 0:
-                    time.sleep(frame_delay)
+            with self.lock:
+                self.latest_jpeg = jpeg_bytes
+                self.latest_frame_time = time.time()
+                self.fps = fps
+                self.scan_ms = round(scan_elapsed, 1)
+                self.staff_present = staff_present
+                self.staff_count = persons_in_staff
+                self.queue_length = queue_count
+                self.avg_wait_seconds = round(avg_dwell, 1)
+                self.max_wait_seconds = round(max_dwell, 1)
+                self.status = status
+                self.current_unattended_seconds = unattend_duration
 
+            # Real-time frame pacing (smooth playback for demo clips)
+            if is_file:
+                target_frame_time = 1.0 / max(10.0, min(25.0, video_fps))
+                elapsed = time.time() - t0
+                if elapsed < target_frame_time:
+                    time.sleep(target_frame_time - elapsed)
+
+        if cap:
             cap.release()
-            time.sleep(1.0)
+        if self.grabber:
+            self.grabber.stop()
+        time.sleep(0.5)
 
-    def _render_hud(self, img, staff_poly, queue_poly, tracks, staff_present, staff_count, queue_count, avg_dwell, status, unattend_sec, cap_thresh, serv_mins, in_monitoring=True, is_fallback=False):
+    def _render_hud(self, img, staff_poly, queue_poly, tracks, staff_present, staff_count, queue_count, avg_dwell, status, unattend_sec, cap_thresh, serv_mins, in_monitoring=True, is_fallback=False, scale_x=1.0, scale_y=1.0):
         h, w = img.shape[:2]
         overlay = img.copy()
         line_thick = max(3, int(w / 640))
@@ -1381,7 +1518,10 @@ class CounterWorker(threading.Thread):
         for tr in tracks:
             if tr.misses > 0:
                 continue
-            x1, y1, x2, y2 = tr.bbox
+            x1 = int(tr.bbox[0] * scale_x)
+            y1 = int(tr.bbox[1] * scale_y)
+            x2 = int(tr.bbox[2] * scale_x)
+            y2 = int(tr.bbox[3] * scale_y)
             if tr.role == 'staff':
                 color = (255, 190, 40)
                 label = f"STAFF #{tr.track_id}"
@@ -1414,19 +1554,21 @@ class CounterWorker(threading.Thread):
 
         # Draw Mobile Phone Usage Bounding Boxes
         for pb, pc, _ in getattr(self, 'active_phone_detections', []):
-            cv2.rectangle(img, (pb[0], pb[1]), (pb[2], pb[3]), COLOR_PHONE, 3)
+            px1, py1, px2, py2 = int(pb[0] * scale_x), int(pb[1] * scale_y), int(pb[2] * scale_x), int(pb[3] * scale_y)
+            cv2.rectangle(img, (px1, py1), (px2, py2), COLOR_PHONE, 2)
             phone_lbl = f"USING PHONE {int(pc * 100)}%"
             (tw, th), _ = cv2.getTextSize(phone_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-            cv2.rectangle(img, (pb[0], max(0, pb[1] - th - 6)), (pb[0] + tw + 8, pb[1]), COLOR_PHONE, -1)
-            cv2.putText(img, phone_lbl, (pb[0] + 4, max(th + 2, pb[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(img, (px1, max(0, py1 - th - 6)), (px1 + tw + 8, py1), COLOR_PHONE, -1)
+            cv2.putText(img, phone_lbl, (px1 + 4, max(th + 2, py1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Draw Customer Agitation / Anger Face Bounding Boxes
         for ab, ac, _, _ in getattr(self, 'active_anger_detections', []):
-            cv2.rectangle(img, (ab[0], ab[1]), (ab[2], ab[3]), (0, 0, 240), 2)
+            ax1, ay1, ax2, ay2 = int(ab[0] * scale_x), int(ab[1] * scale_y), int(ab[2] * scale_x), int(ab[3] * scale_y)
+            cv2.rectangle(img, (ax1, ay1), (ax2, ay2), (40, 40, 240), 2)
             anger_lbl = f"AGITATED CUSTOMER {int(ac * 100)}%"
             (tw, th), _ = cv2.getTextSize(anger_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            cv2.rectangle(img, (ab[0], max(0, ab[1] - th - 6)), (ab[0] + tw + 8, ab[1]), (0, 0, 240), -1)
-            cv2.putText(img, anger_lbl, (ab[0] + 4, max(th + 2, ab[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(img, (ax1, max(0, ay1 - th - 6)), (ax1 + tw + 8, ay1), (40, 40, 240), -1)
+            cv2.putText(img, anger_lbl, (ax1 + 4, max(th + 2, ay1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
         header_h = 40
         cv2.rectangle(img, (0, 0), (w, header_h), COLOR_BG_DARK, -1)
@@ -1491,12 +1633,8 @@ class ModelPool:
         self.model = YOLO(str(model_path))
         print("YOLO person detector loaded successfully!")
 
-        # Mobile Phone Detection Model (best_v2.pt or best.pt)
-        phone_model_path = MODELS / 'best_v2.pt'
-        if not phone_model_path.exists():
-            phone_model_path = ROOT / 'best_v2.pt'
-        if not phone_model_path.exists():
-            phone_model_path = MODELS / 'best.pt'
+        # Mobile Phone Detection Model (best.pt only)
+        phone_model_path = MODELS / 'best.pt'
         if not phone_model_path.exists():
             phone_model_path = ROOT / 'best.pt'
         if phone_model_path.exists():
@@ -1505,7 +1643,7 @@ class ModelPool:
             print(f"Mobile Phone detector loaded successfully! Classes: {self.phone_model.names}")
         else:
             self.phone_model = None
-            print("Notice: best_v2.pt/best.pt not found, mobile phone detection disabled.")
+            print("Notice: best.pt not found, mobile phone detection disabled.")
 
         # YuNet Face Detector for Customer Interaction/Queue Area
         yunet_path = MODELS / 'face_detection_yunet_2023mar.onnx'
@@ -1605,11 +1743,15 @@ class CounterServer:
         except Exception:
             pass
             
-        # Stop existing workers
+        # Stop existing workers cleanly
         with self.lock:
-            for cid, w in list(self.workers.items()):
+            old_workers = list(self.workers.values())
+            for w in old_workers:
                 w.stop()
             self.workers.clear()
+
+        for w in old_workers:
+            w.join(timeout=1.5)
 
         if mode == 'demo':
             DB_PATH = DEMO_DB_PATH
@@ -1961,10 +2103,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Pragma', 'no-cache')
             self.end_headers()
 
+            last_sent_time = 0.0
             while worker.running:
                 with worker.lock:
                     jpeg = worker.latest_jpeg
-                if jpeg:
+                    frame_ts = getattr(worker, 'latest_frame_time', 0.0)
+
+                if jpeg and (frame_ts > last_sent_time or (time.time() - last_sent_time > 1.0)):
+                    last_sent_time = frame_ts if frame_ts > 0 else time.time()
                     try:
                         self.wfile.write(b'--frame\r\n')
                         self.wfile.write(b'Content-Type: image/jpeg\r\n')
@@ -1973,9 +2119,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(b'\r\n')
                     except (BrokenPipeError, ConnectionResetError):
                         break
-                time.sleep(0.04)
+                time.sleep(0.02)
             return
-
         # Static assets
         rel = path.lstrip('/')
         if not rel or rel == '':
